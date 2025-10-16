@@ -15,7 +15,7 @@ The orchestrator wiring lives under `src/ae/`:
 - `planning/` — bootstrap logic that asks the planner LLM (or local heuristics) to seed plans, tasks, and decisions.
 - `phases/` — structured request/response models plus local heuristics for analyze, design, implement, diagnose, fix-violations, plan, and plan-adjust.
 - `memory/` — SQLite-backed persistence and a simple code-symbol index.
-- `tools/` — wrappers for git hygiene, patch application, pytest execution, coverage snapshots, and static gate parsing.
+- `tools/` — wrappers for git hygiene, patch application, pytest execution, cove rage snapshots, and static gate parsing.
 
 ## Quick Start
 - **Prerequisites:** Python 3.11+, a virtual environment, and a GPT-5 API key exported as `OPENAI_API_KEY` or `GPT5_API_KEY` (the CLI falls back to an offline stub)
