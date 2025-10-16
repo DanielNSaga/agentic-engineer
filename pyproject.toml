@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-engineer"
+version = "0.1.0"
+description = "Agentic Engineer CLI scaffold."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "Agentic Engineer Team"}]
+dependencies = [
+    "typer>=0.9,<0.12",
+    "click>=8.1,<8.2",
+    "PyYAML>=6.0",
+    "pydantic>=2.5,<3.0",
+    "libcst>=1.1,<2.0",
+]
+
+[project.scripts]
+ae = "ae.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["ae"]
+src_paths = ["src", "tests"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.agentic_engineer.static_parsers]
+version = 1
+
+[tool.agentic_engineer.static_parsers.python]
+identifiers = ["python"]
+max_findings = 8
+
+[[tool.agentic_engineer.static_parsers.python.patterns]]
+type = "regex"
+scope = "line"
+pattern = '^(?P<path>.+?):(?P<line>\d+):\s*(?:(?:warning|error):\s*)?(?P<message>.+)$'
+message_template = 'python: {message}'
+path_group = 'path'
+line_group = 'line'

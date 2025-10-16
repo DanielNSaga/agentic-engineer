@@ -1,0 +1,30 @@
+Agentic Engineer Policy Capsule
+=========================================
+
+This capsule captures repository-level policies enforced by the
+pipeline. Violations are surfaced as structured CPC findings (CFG001,
+LAY001) and must be resolved before code changes move forward.
+
+CFG001 — Configuration Completeness
+-----------------------------------
+- `config.yaml` MUST define: `project`, `iteration`, `policy`, and `paths`.
+- The file must remain valid YAML and be readable with UTF-8 encoding.
+
+LAY001 — Repository Layout (optional)
+-------------------------------------
+- Enabled when `policy.enforce_layout` is truthy.
+- Required directories: `src/`, `src/ae/policy/`, `src/ae/tools/`, `tests/`.
+- `policy.capsule_path` MUST exist and contain non-empty text guidance.
+
+Runtime Validation Focus
+------------------------
+- The agent prioritises Python runtime errors and failing tests when deciding
+  whether to apply fixes.
+- Additional static gates can be configured via `policy.static_checks` in
+  `config.yaml`, but none are enabled by default.
+
+Coverage Map Scaffold
+---------------------
+- Coverage snapshots record the mapping between test nodeids and source
+  files under `ae.tools.coverage_map.CoverageMap`.
+- Data is persisted as JSON with sorted paths to keep diffs deterministic.
