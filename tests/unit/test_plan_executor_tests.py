@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock
 
-from ae.memory.schema import Plan, Task, TaskStatus
+from ae.memory.schema import Plan, PlanStatus, Task, TaskStatus
 from ae.memory.store import MemoryStore
 from ae.orchestrator import CodingIterationResult, GateRunSummary, PatchApplicationResult
 from ae.planning.executor import PlanExecutor
 from ae.planning.schemas import PlannerTask
+from ae.phases.implement import ImplementResponse
 from ae.tools.pytest_runner import PytestResult
 
 
@@ -366,5 +367,106 @@ def test_maybe_schedule_readme_iteration_skips_when_pending_work(tmp_path) -> No
         assert scheduled is False
         tasks = store.list_tasks(plan_id=plan.id)
         assert all(task.metadata.get("auto_generated") != "readme_polish" for task in tasks)
+    finally:
+        store.close()
+
+
+def test_handle_iteration_readme_auto_schedules_after_clean_review(tmp_path) -> None:
+    executor, store = _build_executor(tmp_path)
+    try:
+        plan = Plan(id="plan-readme-auto", name="Plan", goal="Ship feature")
+        store.create_plan(plan)
+        core_task = Task(
+            id="plan-readme-auto::core",
+            plan_id=plan.id,
+            title="Core task",
+            status=TaskStatus.DONE,
+        )
+        review_task = Task(
+            id="plan-readme-auto::code-review",
+            plan_id=plan.id,
+            title="Perform targeted code review",
+            status=TaskStatus.READY,
+            metadata={"auto_generated": "code_review"},
+            depends_on=[core_task.id],
+        )
+        store.save_task(core_task)
+        store.save_task(review_task)
+
+        result = CodingIterationResult()
+        result.implement = ImplementResponse(summary="All good", no_op_reason="Review-only pass")
+        result.gates = GateRunSummary(ok=True)
+        result.patch = PatchApplicationResult(attempted=False, applied=True, no_op_reason="Review-only pass")
+
+        adjustment, followups = executor._handle_iteration_result(plan, review_task, result)
+        assert adjustment is None
+        assert followups == []
+
+        tasks = store.list_tasks(plan_id=plan.id)
+        readme_tasks = [
+            task for task in tasks if task.metadata.get("auto_generated") == "readme_polish"
+        ]
+        assert len(readme_tasks) == 1
+        readme_task = readme_tasks[0]
+        assert readme_task.status == TaskStatus.READY
+        assert set(readme_task.depends_on) == {core_task.id, review_task.id}
+    finally:
+        store.close()
+
+
+def test_saving_ready_task_reactivates_plan(tmp_path) -> None:
+    db_path = tmp_path / "ae.sqlite"
+    with MemoryStore(db_path) as store:
+        plan = Plan(
+            id="plan-reactivate",
+            name="Plan",
+            goal="Ship",
+            status=PlanStatus.COMPLETED,
+        )
+        store.create_plan(plan)
+
+        task = Task(
+            id="task-new",
+            plan_id=plan.id,
+            title="Follow-up",
+            summary="Handle remaining work",
+            status=TaskStatus.READY,
+        )
+
+        store.save_task(task)
+
+        refreshed = store.get_plan(plan.id)
+        assert refreshed is not None
+        assert refreshed.status == PlanStatus.ACTIVE
+
+
+def test_final_iteration_mode_adds_guidance(tmp_path) -> None:
+    executor, store = _build_executor(tmp_path)
+    try:
+        plan = Plan(id="plan-final-mode", name="Plan", goal="Deliver baseline")
+        store.create_plan(plan)
+        task = Task(id="task-final", plan_id=plan.id, title="Implement core", summary="Build feature")
+        store.save_task(task)
+
+        result = CodingIterationResult()
+        result.gates.ok = True
+
+        for _ in range(PlanExecutor._FINAL_ITERATION_THRESHOLD):
+            plan = executor._record_iteration_metrics(plan, task, result)
+
+        assert executor._final_iteration_mode_active(plan) is True
+
+        planner_task = PlannerTask(title="Wrap up", summary="Prepare final delivery")
+        implement_request = executor._build_implement_request(
+            plan=plan,
+            task=task,
+            planner_task=planner_task,
+            structured_only=False,
+            extra_notes=[],
+            product_spec="",
+        )
+
+        assert any("Final delivery mode" in constraint for constraint in implement_request.constraints)
+        assert any("Final push mode is active" in note for note in implement_request.notes)
     finally:
         store.close()

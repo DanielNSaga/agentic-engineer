@@ -333,6 +333,8 @@ class MemoryStore:
     # Task operations -----------------------------------------------------------------
     def save_task(self, task: Task) -> None:
         record = task.model_copy(update={"updated_at": utc_now()})
+        created_at = _as_iso(record.created_at)
+        updated_at = _as_iso(record.updated_at)
         with self._transaction():
             self._conn.execute(
                 """
@@ -360,10 +362,27 @@ class MemoryStore:
                     _dump_json(record.metadata, default={}),
                     _dump_json(record.depends_on, default=[]),
                     record.priority,
-                    _as_iso(record.created_at),
-                    _as_iso(record.updated_at),
+                    created_at,
+                    updated_at,
                 ),
             )
+            if record.status != TaskStatus.DONE:
+                plan_timestamp = updated_at
+                self._conn.execute(
+                    """
+                    UPDATE plans
+                    SET status = ?, updated_at = ?
+                    WHERE id = ? AND status IN (?, ?, ?)
+                    """,
+                    (
+                        PlanStatus.ACTIVE.value,
+                        plan_timestamp,
+                        record.plan_id,
+                        PlanStatus.COMPLETED.value,
+                        PlanStatus.ARCHIVED.value,
+                        PlanStatus.DRAFT.value,
+                    ),
+                )
 
     def get_task(self, task_id: str) -> Optional[Task]:
         cursor = self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
@@ -417,6 +436,22 @@ class MemoryStore:
                 "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                 (status.value, task_timestamp, task_id),
             )
+            if status != TaskStatus.DONE:
+                self._conn.execute(
+                    """
+                    UPDATE plans
+                    SET status = ?, updated_at = ?
+                    WHERE id = ? AND status IN (?, ?, ?)
+                    """,
+                    (
+                        PlanStatus.ACTIVE.value,
+                        task_timestamp,
+                        plan_id,
+                        PlanStatus.COMPLETED.value,
+                        PlanStatus.ARCHIVED.value,
+                        PlanStatus.DRAFT.value,
+                    ),
+                )
 
             if status == TaskStatus.DONE:
                 remaining = self._conn.execute(

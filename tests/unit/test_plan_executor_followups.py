@@ -8,7 +8,7 @@ from ae.phases.implement import ImplementResponse
 from ae.phases.plan_adjust import PlanAdjustResponse
 from ae.planning.executor import PlanExecutor
 from ae.planning.schemas import PlannerResponse, PlannerTask
-from ae.orchestrator import CodingIterationResult, PatchApplicationResult
+from ae.orchestrator import CodingIterationResult, FailureCategory, PatchApplicationResult
 
 
 def _build_executor(store: MemoryStore) -> PlanExecutor:
@@ -290,6 +290,86 @@ def test_code_review_task_includes_recent_touched_files(tmp_path) -> None:
         assert "tests/test_core.py" in implement_request.touched_files
 
 
+def test_final_iteration_mode_skips_auto_review_iteration(tmp_path) -> None:
+    db_path = tmp_path / "ae.sqlite"
+    with MemoryStore(db_path) as store:
+        plan = Plan(
+            id="plan-final-review",
+            name="Review Plan",
+            goal="Ship baseline",
+            metadata={"final_iteration_mode": {"active": True}},
+        )
+        store.create_plan(plan)
+
+        completed = Task(
+            id="task-core",
+            plan_id=plan.id,
+            title="Implement feature",
+            status=TaskStatus.DONE,
+        )
+        store.save_task(completed)
+
+        executor = _build_executor(store)
+        scheduled = executor._maybe_schedule_code_review_iteration(plan)
+        assert scheduled is False
+
+        tasks = store.list_tasks(plan_id=plan.id)
+        assert len(tasks) == 1
+
+
+def test_auto_review_followups_stop_after_limit(tmp_path) -> None:
+    db_path = tmp_path / "ae.sqlite"
+    with MemoryStore(db_path) as store:
+        plan = Plan(id="plan-review-limit", name="Review Plan", goal="Constrain followups")
+        store.create_plan(plan)
+
+        review_task = Task(
+            id="task-review",
+            plan_id=plan.id,
+            title="Conduct review",
+            status=TaskStatus.DONE,
+            priority=3,
+        )
+        store.save_task(review_task)
+
+        executor = _build_executor(store)
+        executor._invoke_review_followup_planner = MagicMock(return_value=None)
+
+        first_result = CodingIterationResult(
+            implement=ImplementResponse(
+                summary="Initial review",
+                follow_up=["Fix bug :: ensure new config path is validated"],
+            ),
+            patch=PatchApplicationResult(),
+        )
+
+        followups_one = executor._spawn_review_followups(plan, review_task, first_result)
+        assert followups_one
+        assert followups_one[0].metadata.get("source") == "auto_code_review_followup"
+
+        plan = store.get_plan(plan.id) or plan
+
+        second_result = CodingIterationResult(
+            implement=ImplementResponse(
+                summary="Second review",
+                follow_up=["Add docs :: update README with usage example"],
+            ),
+            patch=PatchApplicationResult(),
+        )
+
+        followups_two = executor._spawn_review_followups(plan, review_task, second_result)
+        assert followups_two == []
+
+        decisions = store.list_decisions(plan.id)
+        suppressed = [decision for decision in decisions if decision.kind == "auto_review_followup_suppressed"]
+        assert suppressed
+        assert suppressed[-1].metadata.get("reason") == "followup_limit_reached"
+
+        state = (store.get_plan(plan.id) or plan).metadata.get("auto_review_state", {})
+        assert state.get("followup_plan_rounds") == 1
+        assert state.get("suppressed_rounds") == 1
+
+
 def test_auto_review_iteration_without_edits_marks_task_done(tmp_path) -> None:
     db_path = tmp_path / "ae.sqlite"
     with MemoryStore(db_path) as store:
@@ -327,3 +407,71 @@ def test_auto_review_iteration_without_edits_marks_task_done(tmp_path) -> None:
         assert stored_review is not None
         assert stored_review.status == TaskStatus.DONE
         assert "Implement response did not include any updates." not in result.errors
+
+
+def test_iteration_no_patch_marks_task_failed_without_followups(tmp_path) -> None:
+    db_path = tmp_path / "ae.sqlite"
+    with MemoryStore(db_path) as store:
+        plan = Plan(id="plan-no-diff", name="No Diff Plan", goal="Handle empty patches")
+        store.create_plan(plan)
+
+        origin_task = Task(
+            id="task-no-diff",
+            plan_id=plan.id,
+            title="Implement fix",
+            status=TaskStatus.READY,
+        )
+        store.save_task(origin_task)
+
+        executor = _build_executor(store)
+
+        result = CodingIterationResult(
+            patch=PatchApplicationResult(
+                attempted=False,
+                applied=False,
+                error="Implement response did not include any updates.",
+            )
+        )
+        result.errors.append("Implement response did not include any updates.")
+        result.failure_category = FailureCategory.NO_PATCH
+
+        adjustment, followups = executor._handle_iteration_result(plan, origin_task, result)
+
+        assert adjustment is None
+        assert followups == []
+
+        stored_task = store.get_task(origin_task.id)
+        assert stored_task is not None
+        assert stored_task.status == TaskStatus.FAILED
+        executor._orchestrator.run_phase.assert_not_called()
+
+
+def test_iteration_safety_stop_marks_task_failed(tmp_path) -> None:
+    db_path = tmp_path / "ae.sqlite"
+    with MemoryStore(db_path) as store:
+        plan = Plan(id="plan-safety", name="Safety Plan", goal="Handle safety rails")
+        store.create_plan(plan)
+
+        origin_task = Task(
+            id="task-safety",
+            plan_id=plan.id,
+            title="Implement feature",
+            status=TaskStatus.READY,
+        )
+        store.save_task(origin_task)
+
+        executor = _build_executor(store)
+
+        result = CodingIterationResult()
+        result.errors.append("Auto-loop exceeded 20 cycles without success.")
+        result.failure_category = FailureCategory.SAFETY_STOP
+
+        adjustment, followups = executor._handle_iteration_result(plan, origin_task, result)
+
+        assert adjustment is None
+        assert followups == []
+
+        stored_task = store.get_task(origin_task.id)
+        assert stored_task is not None
+        assert stored_task.status == TaskStatus.FAILED
+        executor._orchestrator.run_phase.assert_not_called()

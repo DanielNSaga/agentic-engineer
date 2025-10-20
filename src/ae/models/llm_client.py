@@ -232,7 +232,7 @@ class LLMRequest(Generic[T]):
 class LLMClient:
     """High-level helper that enforces JSON responses and schema validation."""
 
-    def __init__(self, model: str, *, max_attempts: int = 3, retry_delay: float = 0.5) -> None:
+    def __init__(self, model: str, *, max_attempts: int = 5, retry_delay: float = 0.5) -> None:
         self._model = model
         self._max_attempts = max_attempts
         self._retry_delay = retry_delay

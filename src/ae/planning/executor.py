@@ -17,9 +17,24 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from ..memory.code_index.indexer import CodeIndexer
-from ..memory.schema import Decision, IncidentSeverity, Plan, PlanStatus, Task, TaskStatus, TestStatus
+from ..memory.schema import (
+    Decision,
+    IncidentSeverity,
+    Plan,
+    PlanStatus,
+    Task,
+    TaskStatus,
+    TestStatus,
+    utc_now,
+)
 from ..memory.store import MemoryStore
-from ..orchestrator import CodingIterationPlan, CodingIterationResult, Orchestrator, PatchApplicationResult
+from ..orchestrator import (
+    CodingIterationPlan,
+    CodingIterationResult,
+    FailureCategory,
+    Orchestrator,
+    PatchApplicationResult,
+)
 from ..utils import slugify
 from ..phases import PhaseName
 from ..phases.analyze import AnalyzeRequest
@@ -304,6 +319,8 @@ class PlanExecutor:
     _AUTO_METADATA_KEY = "auto_generated"
     _AUTO_TASK_SEED = "polish-readme"
     _MAX_PENDING_PLAN_ADJUST_FOLLOWUPS = 3
+    _AUTO_REVIEW_PLAN_LIMIT = 1
+    _FINAL_ITERATION_THRESHOLD = 50
 
     def __init__(
         self,
@@ -383,6 +400,7 @@ class PlanExecutor:
                 # If reopening fails, propagate so callers can handle persistence errors.
                 raise
             self._update_coverage_map(planner_task, result)
+            plan = self._record_iteration_metrics(plan, task, result)
             adjustment, followups = self._handle_iteration_result(plan, task, result)
             summary.iterations.append(
                 IterationOutcome(
@@ -476,6 +494,11 @@ class PlanExecutor:
         deliverables = self._coerce_string_collection(planner_task.deliverables)
         dependencies = self._coerce_string_collection(planner_task.depends_on)
 
+        if self._final_iteration_mode_active(plan):
+            constraints.append(
+                "Final delivery mode: prioritise shipping a working baseline over polish or optional refactors."
+            )
+
         failure_notes = self._collect_failure_notes(plan)
         incident_notes = self._collect_incident_notes(plan)
         decision_notes = self._collect_decision_notes(plan, task)
@@ -486,6 +509,7 @@ class PlanExecutor:
         combined_notes.extend(incident_notes)
         combined_notes.extend(planner_task.notes or [])
         combined_notes.extend(extra_notes or [])
+        combined_notes.extend(self._final_iteration_notes(plan))
 
         context_sections = self._build_implement_context(
             plan=plan,
@@ -1044,6 +1068,12 @@ class PlanExecutor:
         task: Task,
         result: CodingIterationResult,
     ) -> list[Task]:
+        if result.failure_category in {
+            FailureCategory.NO_PATCH,
+            FailureCategory.DIAGNOSE_NO_PATCH,
+            FailureCategory.SAFETY_STOP,
+        }:
+            return []
         diagnose = getattr(result, "diagnose", None)
         recommendations = list(getattr(diagnose, "recommended_fixes", []) or [])
         recommendations.extend(result.errors or [])
@@ -1150,10 +1180,26 @@ class PlanExecutor:
             followups: list[Task] = []
             if auto_review:
                 followups = self._spawn_review_followups(plan, task, result)
+                if not followups:
+                    active_plan = self._refresh_plan(plan.id) or plan
+                    self._maybe_schedule_readme_iteration(active_plan)
             self._unlock_blocked_tasks(plan.id)
             return None, followups
 
-        self._store.update_task_status(task.id, TaskStatus.BLOCKED)
+        failure_category = result.failure_category
+        terminal_categories = {
+            FailureCategory.NO_PATCH,
+            FailureCategory.DIAGNOSE_NO_PATCH,
+            FailureCategory.SAFETY_STOP,
+        }
+        terminal_failure = failure_category in terminal_categories
+        next_status = TaskStatus.FAILED if terminal_failure else TaskStatus.BLOCKED
+
+        self._store.update_task_status(task.id, next_status)
+        if terminal_failure:
+            self._unlock_blocked_tasks(plan.id)
+            return None, []
+
         self._seed_diagnose_followups(plan, task, result)
         adjustment = self._request_plan_adjustment(plan, task, result)
         followups = self._materialize_followups(plan, task, adjustment)
@@ -1170,11 +1216,13 @@ class PlanExecutor:
         patch = result.patch
         tolerated_errors: set[str] = set()
         if patch.applied or patch.no_op_reason:
+            result.failure_category = None
             return True, tolerated_errors
 
         error_message = (patch.error or "").strip()
         if error_message == "Implement response did not include any updates.":
             tolerated_errors.add(error_message)
+            result.failure_category = None
             return True, tolerated_errors
 
         return False, set()
@@ -1462,6 +1510,159 @@ class PlanExecutor:
                 return updated, True
             return plan, True
         return plan, False
+
+    # ------------------------------------------------------- plan state helpers
+    def _get_plan_metadata(self, plan: Plan) -> dict[str, Any]:
+        metadata = plan.metadata or {}
+        if isinstance(metadata, Mapping):
+            return dict(metadata)
+        return dict(metadata)
+
+    def _update_plan_metadata(self, plan: Plan, mutator: Callable[[dict[str, Any]], None]) -> Plan:
+        metadata = self._get_plan_metadata(plan)
+        mutator(metadata)
+        updated = plan.model_copy(update={"metadata": metadata})
+        self._store.create_plan(updated)
+        return updated
+
+    def _final_iteration_mode_active(self, plan: Plan) -> bool:
+        metadata = plan.metadata or {}
+        final_mode = metadata.get("final_iteration_mode")
+        if isinstance(final_mode, Mapping):
+            return bool(final_mode.get("active"))
+        if isinstance(final_mode, bool):
+            return bool(final_mode)
+        return False
+
+    def _final_iteration_notes(self, plan: Plan) -> list[str]:
+        if not self._final_iteration_mode_active(plan):
+            return []
+        metadata = plan.metadata or {}
+        final_mode = metadata.get("final_iteration_mode") or {}
+        activated_iter = final_mode.get("activated_at_iteration") or self._FINAL_ITERATION_THRESHOLD
+        return [
+            f"Final push mode is active after {activated_iter} iterations; deliver a working baseline users can run today.",
+            "Defer cosmetic clean-up, TODOs, and low-impact refactors unless they block core functionality.",
+            "Focus on ensuring primary workflows operate end-to-end and communicate any remaining gaps clearly.",
+        ]
+
+    def _get_auto_review_state(self, plan: Plan) -> dict[str, Any]:
+        metadata = plan.metadata or {}
+        state = metadata.get("auto_review_state")
+        if isinstance(state, Mapping):
+            return dict(state)
+        return {}
+
+    def _auto_review_can_create_tasks(self, plan: Plan) -> bool:
+        if self._final_iteration_mode_active(plan):
+            return False
+        state = self._get_auto_review_state(plan)
+        rounds = int(state.get("followup_plan_rounds", 0))
+        return rounds < self._AUTO_REVIEW_PLAN_LIMIT
+
+    def _record_auto_review_plan_round(
+        self,
+        plan: Plan,
+        *,
+        followup_count: int,
+        digests: Sequence[str],
+    ) -> None:
+        timestamp = utc_now().isoformat()
+
+        def _mutator(metadata: dict[str, Any]) -> None:
+            state = dict(metadata.get("auto_review_state") or {})
+            state["followup_plan_rounds"] = int(state.get("followup_plan_rounds", 0)) + 1
+            state["last_round_at"] = timestamp
+            state["last_followup_count"] = followup_count
+            state["last_round_digests"] = list(digests)
+            metadata["auto_review_state"] = state
+
+        self._update_plan_metadata(plan, _mutator)
+
+    def _record_auto_review_suppressed(
+        self,
+        plan: Plan,
+        *,
+        reason: str,
+        digests: Sequence[str],
+    ) -> None:
+        timestamp = utc_now().isoformat()
+
+        def _mutator(metadata: dict[str, Any]) -> None:
+            state = dict(metadata.get("auto_review_state") or {})
+            state["suppressed_rounds"] = int(state.get("suppressed_rounds", 0)) + 1
+            state["last_suppressed_reason"] = reason
+            state["last_suppressed_at"] = timestamp
+            state["last_suppressed_digests"] = list(digests)
+            metadata["auto_review_state"] = state
+
+        self._update_plan_metadata(plan, _mutator)
+
+    def _record_suppressed_review_followups(
+        self,
+        plan: Plan,
+        review_task: Task,
+        entries: Sequence[tuple[str, str]],
+        *,
+        reason: str,
+    ) -> None:
+        if not entries:
+            return
+        lines = [
+            f"Auto code review follow-ups were suppressed ({reason}).",
+            "Outstanding findings:",
+        ]
+        for entry, digest in entries:
+            lines.append(f"- [{digest}] {entry}")
+        decision = Decision(
+            id=self._generate_decision_id(plan.id),
+            plan_id=plan.id,
+            task_id=review_task.id,
+            title=f"Suppressed auto review follow-ups ({review_task.id})",
+            content="\n".join(lines),
+            kind="auto_review_followup_suppressed",
+            metadata={
+                "reason": reason,
+                "digests": [digest for _, digest in entries],
+            },
+        )
+        self._store.record_decision(decision)
+
+    def _record_iteration_metrics(self, plan: Plan, task: Task, result: CodingIterationResult) -> Plan:
+        timestamp = utc_now().isoformat()
+        errors = list(result.errors or [])
+        iteration_success = bool(result.ok)
+
+        def _mutator(metadata: dict[str, Any]) -> None:
+            metrics = dict(metadata.get("iteration_metrics") or {})
+            total_iterations = int(metrics.get("total_iterations", 0)) + 1
+            metrics["total_iterations"] = total_iterations
+            metrics["last_iteration_at"] = timestamp
+            metrics["last_task_id"] = task.id
+            metrics["last_task_title"] = task.title
+            metrics["last_result_ok"] = iteration_success
+            if iteration_success:
+                metrics["successful_iterations"] = int(metrics.get("successful_iterations", 0)) + 1
+                metrics["last_success_at"] = timestamp
+            else:
+                metrics["failed_iterations"] = int(metrics.get("failed_iterations", 0)) + 1
+                metrics["last_failure_at"] = timestamp
+                if errors:
+                    metrics["last_failure_reason"] = errors[-1]
+            metadata["iteration_metrics"] = metrics
+
+            final_mode = dict(metadata.get("final_iteration_mode") or {})
+            if total_iterations >= self._FINAL_ITERATION_THRESHOLD:
+                if not final_mode.get("active"):
+                    final_mode["active"] = True
+                    final_mode["reason"] = "iteration_limit"
+                    final_mode["activated_at_iteration"] = total_iterations
+                    final_mode["activated_at"] = timestamp
+                metadata["final_iteration_mode"] = final_mode
+            elif "final_iteration_mode" in metadata:
+                metadata["final_iteration_mode"] = final_mode
+
+        return self._update_plan_metadata(plan, _mutator)
 
     # --------------------------------------------------------------- utilities
     def _load_planner_task(self, task: Task) -> PlannerTask:
@@ -2087,6 +2288,8 @@ class PlanExecutor:
 
     # -------------------------------------------------------------- auto review
     def _maybe_schedule_code_review_iteration(self, plan: Plan) -> bool:
+        if self._final_iteration_mode_active(plan):
+            return False
         tasks = self._store.list_tasks(plan_id=plan.id)
         if not tasks:
             return False
@@ -2132,16 +2335,16 @@ class PlanExecutor:
             title="Perform targeted code review",
             summary=summary,
             constraints=[
-                "Investigate only issues that could cause failures, regressions, security incidents, or major user confusion.",
-                "Skip purely stylistic nitpicks unless they introduce functional risk.",
+                "Investigate only findings that would block shipping: crashes, data loss, security issues, or major user confusion.",
+                "Ignore stylistic nits, formatting, or optional cleanup unless they hide a functional bug.",
                 "Do not modify repository files; limit the response to analysis only.",
-                "For each substantive finding, add a follow_up entry using the format 'Task Title :: Required fix'.",
+                "For each substantive blocker, add a follow_up entry using the format 'Task Title :: Required fix'.",
             ],
             deliverables=["Actionable code review findings"],
             notes=[
-                "Prioritise correctness gaps, missing validation, data handling problems, and test omissions that create high-severity risk.",
-                "Do not require exhaustive edge-case tests; only highlight missing coverage when it could conceal a serious defect.",
-                "If no major issues remain, explain why the implementation appears sound and leave follow_up empty.",
+                "Focus on correctness gaps, missing validation, data handling issues, and test omissions that break core workflows.",
+                "Skip exhaustive edge-case coverage or performance micro-optimisations unless they cause observable failures.",
+                "If no blocking issues remain, state that the implementation looks shippable and leave follow_up empty.",
             ],
             metadata={
                 **planner_metadata,
@@ -2169,10 +2372,10 @@ class PlanExecutor:
 
     def _render_code_review_summary(self, plan: Plan, completed_tasks: Sequence[Task]) -> str:
         lines: list[str] = [
-            "Perform a high-severity code review over the completed tasks before finalising documentation.",
-            "Focus on correctness, resiliency, security, and only those test coverage gaps that could break the product or confuse users.",
-            "Skip requests for exhaustive edge-case tests; call out missing coverage only when it hides likely high-severity bugs.",
-            "Only surface actionable problems; ignore cosmetic issues unless they impact functionality.",
+            "Perform a pragmatic code review over the completed tasks before finalising documentation.",
+            "Focus on correctness, resiliency, security, and only those gaps that would break the product or materially confuse users.",
+            "Skip exhaustive edge-case requests; highlight missing coverage only when it hides a likely failure.",
+            "Surface actionable blockers and leave out cosmetic or low-impact polish.",
             "For each meaningful issue, record a follow_up entry as 'Task Title :: What must be fixed'.",
         ]
 
@@ -2241,6 +2444,14 @@ class PlanExecutor:
         if not pending_entries:
             return []
 
+        allow_followups = self._auto_review_can_create_tasks(plan)
+        if not allow_followups:
+            reason = "final_iteration_mode" if self._final_iteration_mode_active(plan) else "followup_limit_reached"
+            digests = [digest for _, digest in pending_entries]
+            self._record_auto_review_suppressed(plan, reason=reason, digests=digests)
+            self._record_suppressed_review_followups(plan, task, pending_entries, reason=reason)
+            return []
+
         planned_followups = self._plan_review_followups(
             plan,
             task,
@@ -2250,6 +2461,8 @@ class PlanExecutor:
         )
         if planned_followups:
             return planned_followups
+        if not self._auto_review_can_create_tasks(plan):
+            return []
 
         followups: list[Task] = []
         for entry, digest in pending_entries:
@@ -2273,6 +2486,9 @@ class PlanExecutor:
             )
             self._store.save_task(new_task)
             followups.append(new_task)
+        if followups:
+            digests = [digest for _, digest in pending_entries]
+            self._record_auto_review_plan_round(plan, followup_count=len(followups), digests=digests)
         return followups
 
     def _plan_review_followups(
@@ -2344,6 +2560,12 @@ class PlanExecutor:
             tasks_override=filtered_tasks,
             ignored_tasks=ignored_tasks,
         )
+        if followups:
+            self._record_auto_review_plan_round(
+                plan,
+                followup_count=len(followups),
+                digests=digests,
+            )
         return followups
 
     def _invoke_review_followup_planner(
@@ -2697,6 +2919,8 @@ class PlanExecutor:
 
     # ------------------------------------------------------------- auto README
     def _maybe_schedule_readme_iteration(self, plan: Plan) -> bool:
+        if self._final_iteration_mode_active(plan):
+            return False
         tasks = self._store.list_tasks(plan_id=plan.id)
         if not tasks:
             return False

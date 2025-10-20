@@ -65,7 +65,7 @@ DEFAULT_CONFIG_TEMPLATE: Dict[str, Any] = {
         "default": "gpt-5-mini",
         "planner": "gpt-5-mini",
         "embedding": "text-embedding-3-large",
-        "timeout": 250,
+        "timeout": 300,
     },
     "git": {
         "auto_clean": {
@@ -85,7 +85,7 @@ DEFAULT_CONFIG_TEMPLATE: Dict[str, Any] = {
     "context": {
         "guidance": [
             "Act as the sole engineer, make decisions independently, avoid questions, and record assumptions in your final summary.",
-            "Treat config.yaml and pyproject.toml as read-only.",
+            "Treat config.yaml and pyproject.toml as read-only, and follow pyproject.toml format (e.g Python 3.11+).",
             "Do not create separate planning docs; use concise inline comments only where needed and summarize key decisions at the end of each run.",
             "Rebuild state from repo files each iteration and restate critical decisions so future cycles inherit context.",
             "Place code in src/ and tests in tests/; reorganize modules only when it improves maintainability.",

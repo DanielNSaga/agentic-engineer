@@ -25,7 +25,7 @@ class GPT5Client(LLMClient):
         model: str = "gpt-5",
         transport: Optional[Transport] = None,
         timeout: float = 60.0,
-        max_attempts: int = 3,
+        max_attempts: int = 5,
         retry_delay: float = 0.5,
     ) -> None:
         super().__init__(model=model, max_attempts=max_attempts, retry_delay=retry_delay)

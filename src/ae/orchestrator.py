@@ -14,6 +14,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
 
@@ -158,6 +159,21 @@ _PLACEHOLDER_ASSERTIONS: set[str] = {
 }
 
 
+class FailureCategory(str, Enum):
+    """High-level reason why an iteration failed."""
+
+    NO_PATCH = "no_patch"
+    DIAGNOSE_NO_PATCH = "diagnose_no_patch"
+    SAFETY_STOP = "safety_stop"
+    PATCH_FAILURE = "patch_failure"
+
+
+_NO_PATCH_MESSAGES: set[str] = {
+    "Implement response did not include any updates.",
+    "Patch payload was empty.",
+}
+
+
 @dataclass(slots=True)
 class PatchApplicationResult:
     """Outcome of attempting to apply a patch."""
@@ -253,6 +269,7 @@ class CodingIterationResult:
     diagnose_attempts: list[str] = field(default_factory=list)
     cycles: list[IterationCycle] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    failure_category: FailureCategory | None = None
     checkpoint_label: str | None = None
     rolled_back: bool = False
     artifact_path: Path | None = None
@@ -517,6 +534,10 @@ class Orchestrator:
 
                     if not patch_result.applied:
                         message = patch_result.error or "Implement response did not include any updates."
+                        if message in _NO_PATCH_MESSAGES:
+                            result.failure_category = FailureCategory.NO_PATCH
+                        elif result.failure_category is None:
+                            result.failure_category = FailureCategory.PATCH_FAILURE
                         self._record_error(result, message)
                         cycle_errors.append(message)
                         result.cycles.append(
@@ -714,6 +735,7 @@ class Orchestrator:
                 if final_message not in filtered_errors:
                     filtered_errors.append(final_message)
                 result.errors = filtered_errors or [final_message]
+                result.failure_category = FailureCategory.SAFETY_STOP
             elif iteration_success and not result.errors and not revert_on_exit:
                 try:
                     sha, message = self._auto_commit(
@@ -2122,6 +2144,8 @@ class Orchestrator:
             patch_provided = bool(files or edits or patch_text.strip())
             if not files and not edits and not patch_text.strip():
                 attempt_outcome = "Diagnose response did not include any updates."
+                if result.failure_category is None:
+                    result.failure_category = FailureCategory.DIAGNOSE_NO_PATCH
                 _record_diagnose_attempt(
                     attempt_index=attempt_index,
                     failing=failing_tests,
