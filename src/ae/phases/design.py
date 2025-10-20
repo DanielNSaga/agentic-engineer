@@ -17,8 +17,8 @@ class DesignRequest:
     task_id: str
     goal: str
     proposed_interfaces: list[str] = field(default_factory=list)
-    open_questions: list[str] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
+    product_spec: str = ""
 
 
 @dataclass(slots=True)

@@ -4,4 +4,6 @@ __pycache__/
 venv/
 .idea/
 .DS_Store
-
+*.egg-info
+.ruff_cache
+.pytest_cache

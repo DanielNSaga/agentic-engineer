@@ -30,6 +30,7 @@ class PlanAdjustResponse:
 
     adjustments: list["PlanAdjustment"]
     new_tasks: list[str] = field(default_factory=list)
+    drop_tasks: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 

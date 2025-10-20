@@ -24,6 +24,7 @@ from ..models.llm_client import LLMClient, LLMClientError, LLMRequest
 from ..phases import PhaseName
 from ..phases.plan import PlanRequest as PhasePlanRequest, run as run_plan
 from ..tools.vcs import GitError, GitRepository
+from ..utils import slugify
 from .schemas import (
     PlannerAnalysis,
     PlannerDecision,
@@ -32,6 +33,7 @@ from .schemas import (
     PlannerRisk,
     PlannerTask,
 )
+from .task_filters import looks_like_test_execution, task_is_test_execution
 
 try:  # pragma: no cover - prefer stdlib tomllib when available
     import tomllib as _native_tomllib  # type: ignore[attr-defined]
@@ -130,6 +132,15 @@ def bootstrap_initial_plan(
             "constraints": prune_result.pruned_constraints,
             "deliverables": prune_result.pruned_deliverables,
         }
+
+    index_insights = builder.index_insights_for_plan(
+        goal=goal_normalised,
+        constraints=constraint_list,
+        deliverables=deliverable_list,
+        notes=notes_list,
+    )
+    if index_insights:
+        repo_summary["index_insights"] = index_insights
 
     base_plan_request = PhasePlanRequest(
         goal=goal_normalised,
@@ -351,6 +362,7 @@ def bootstrap_initial_plan(
         raise RuntimeError("Planner did not return a response.")
 
     _enrich_plan_with_analysis(plan_response, analysis_model)
+    _filter_plan_tasks(plan_response)
 
     context = final_pass.context
     if context is None:
@@ -586,9 +598,8 @@ def _compose_synthesis_notes(
     """Guidance supplied to the synthesis (draft) planner pass."""
     notes = [
         "Return valid JSON matching the PlannerResponse schema.",
-        "Produce at least three focused tasks with explicit dependencies and acceptance criteria.",
+        "Produce at least three focused tasks with explicit dependencies.",
         "Populate each task's `metadata.touched_files` with concrete paths to inspect or modify.",
-        "Populate each task's `metadata.validation_commands` with commands or tests that confirm success.",
         "Avoid overlapping scopes; each task should deliver a narrowly defined outcome.",
     ]
     trimmed_goal = goal.strip()
@@ -1012,6 +1023,116 @@ def _enrich_plan_with_analysis(
             enriched_tasks.append(task)
 
     plan_response.tasks = enriched_tasks
+
+
+def _filter_plan_tasks(plan_response: PlannerResponse) -> list[dict[str, Any]]:
+    """Remove planner tasks that conflict with agent execution policies."""
+    tasks = list(plan_response.tasks)
+    if not tasks:
+        return []
+
+    kept: list[PlannerTask] = []
+    removed: list[dict[str, Any]] = []
+    removed_aliases: set[str] = set()
+    removed_aliases_lower: set[str] = set()
+
+    for task in tasks:
+        reason = _filter_task_reason(task)
+        if reason is None:
+            kept.append(task)
+            continue
+
+        entry: dict[str, Any] = {"reason": reason}
+        if isinstance(task.id, str) and task.id.strip():
+            entry["id"] = task.id.strip()
+            removed_aliases.add(task.id.strip())
+            removed_aliases_lower.add(task.id.strip().lower())
+        if isinstance(task.title, str) and task.title.strip():
+            entry["title"] = task.title.strip()
+            removed_aliases.add(task.title.strip())
+            removed_aliases_lower.add(task.title.strip().lower())
+        if isinstance(task.summary, str) and task.summary.strip():
+            entry.setdefault("summary", task.summary.strip())
+        removed.append(entry)
+
+    if not removed:
+        return []
+
+    plan_response.tasks = kept
+    _prune_removed_task_dependencies(plan_response.tasks, removed_aliases, removed_aliases_lower)
+
+    metadata = dict(plan_response.metadata or {})
+    filtered_history = metadata.get("filtered_tasks")
+    if isinstance(filtered_history, list):
+        filtered_history.extend(removed)
+    else:
+        metadata["filtered_tasks"] = removed
+    plan_response.metadata = metadata
+    return removed
+
+
+def _filter_task_reason(task: PlannerTask) -> str | None:
+    if _task_targets_readme(task):
+        return "targets_readme"
+    if task_is_test_execution(task):
+        return "test_execution"
+    return None
+
+
+def _task_targets_readme(task: PlannerTask) -> bool:
+    candidates: list[str] = []
+    for value in (task.title, task.summary):
+        if isinstance(value, str):
+            candidates.append(value)
+
+    sequences = (
+        task.deliverables,
+        task.optional_deliverables,
+        task.notes,
+        task.constraints,
+        task.acceptance_criteria,
+    )
+    for sequence in sequences:
+        for item in sequence or []:
+            if isinstance(item, str):
+                candidates.append(item)
+
+    metadata = task.metadata or {}
+    touched = metadata.get("touched_files")
+    if isinstance(touched, Sequence) and not isinstance(touched, str):
+        for item in touched:
+            if isinstance(item, str):
+                candidates.append(item)
+
+    return any("readme" in text.lower() for text in candidates if isinstance(text, str))
+
+
+def _prune_removed_task_dependencies(
+    tasks: Sequence[PlannerTask],
+    removed_aliases: set[str],
+    removed_aliases_lower: set[str],
+) -> None:
+    if not removed_aliases:
+        return
+    for task in tasks:
+        depends_on = list(task.depends_on or [])
+        if not depends_on:
+            continue
+        filtered: list[str] = []
+        changed = False
+        for dependency in depends_on:
+            if not isinstance(dependency, str):
+                filtered.append(dependency)
+                continue
+            cleaned = dependency.strip()
+            if not cleaned:
+                continue
+            if cleaned in removed_aliases or cleaned.lower() in removed_aliases_lower:
+                changed = True
+                continue
+            filtered.append(dependency)
+        if changed or len(filtered) != len(depends_on):
+            task.depends_on = filtered
 
 
 def _looks_like_non_empty_sequence(value: Any) -> bool:
@@ -2418,13 +2539,17 @@ def _resolve_dependency(reference: str | None, alias_map: Mapping[str, str]) -> 
 
 def _normalize_alias(value: str) -> str:
     """Normalise alias strings before inserting into the alias map."""
-    return _slugify(value).lower()
+    return slugify(value, fallback="alias", lowercase=True)
 
 
 def _scoped_identifier(plan_id: str, candidate: str, existing: Iterable[str]) -> str:
     """Generate a unique identifier scoped to ``plan_id``."""
     base = candidate.strip() or "item"
-    scoped = base if base.startswith(f"{plan_id}::") else f"{plan_id}::{_slugify(base)}"
+    if base.startswith(f"{plan_id}::"):
+        scoped = base
+    else:
+        slugged = slugify(base, fallback="item", lowercase=True)
+        scoped = f"{plan_id}::{slugged}"
     if scoped not in existing:
         return scoped
     suffix = 2
@@ -2440,22 +2565,11 @@ def _normalise_plan_id(candidate: str, *, fallback: str) -> str:
     cleaned = candidate.strip()
     if not cleaned:
         return fallback
-    slugged = _slugify(cleaned)
-    return slugged or fallback
+    return slugify(cleaned, fallback=fallback, lowercase=True) or fallback
 
 
 def _default_plan_id(project_name: str) -> str:
     """Construct a timestamped plan identifier derived from the project name."""
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    slug = _slugify(project_name)
+    slug = slugify(project_name, fallback="plan", lowercase=True)
     return f"{slug}-plan-{timestamp}"
-
-
-def _slugify(value: str) -> str:
-    """Convert arbitrary strings into lowercase slug tokens."""
-    lowered = value.lower()
-    mapped = ["-" if not ch.isalnum() else ch for ch in lowered]
-    slug = "".join(mapped)
-    while "--" in slug:
-        slug = slug.replace("--", "-")
-    return slug.strip("-") or "plan"

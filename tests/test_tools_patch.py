@@ -72,6 +72,37 @@ def test_build_structured_patch_replaces_entire_file_without_end_line(tmp_path: 
     assert tracked.read_text(encoding="utf-8") == "gamma\ndelta\n"
 
 
+def test_build_structured_patch_deletes_file(tmp_path: Path) -> None:
+    repo, tracked = _prepare_repo(tmp_path)
+    edit = StructuredEditOperation(path="tracked.txt", action="delete")
+
+    diff = build_structured_patch(repo_root=repo.root, files=[], edits=[edit])
+
+    apply_patch(diff, repo_root=repo.root)
+    assert not tracked.exists()
+    assert Path("tracked.txt") in repo.working_tree_changes()
+
+
+def test_build_structured_patch_deletes_directory(tmp_path: Path) -> None:
+    repo, tracked = _prepare_repo(tmp_path)
+
+    package_root = tmp_path / "pkg"
+    package_root.mkdir()
+    module = package_root / "module.py"
+    module.write_text("print('hello')\n", encoding="utf-8")
+    repo.git("add", "pkg/module.py")
+    repo.git("commit", "-m", "add pkg", check=True)
+
+    edit = StructuredEditOperation(path="pkg", action="delete")
+
+    diff = build_structured_patch(repo_root=repo.root, files=[], edits=[edit])
+
+    apply_patch(diff, repo_root=repo.root)
+    assert not package_root.exists()
+    assert Path("pkg/module.py") in repo.working_tree_changes()
+    assert tracked.exists()
+
+
 def test_canonicalise_unified_diff_handles_apply_patch_format(tmp_path: Path) -> None:
     repo, tracked = _prepare_repo(tmp_path)
     patch = textwrap.dedent(

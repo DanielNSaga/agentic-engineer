@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import typer
 import yaml
 
+from .context_builder import ContextBuilder
 from .memory.code_index.indexer import CodeIndexer
 from .memory.schema import Plan, PlanStatus, TaskStatus
 from .memory.store import MemoryStore
@@ -25,8 +26,11 @@ from .phases.implement import ImplementRequest
 from .phases.plan_adjust import PlanAdjustmentItem
 from .planning import bootstrap_initial_plan
 from .planning.executor import PlanExecutionSummary, PlanExecutor
+from .tools.phase_logs import load_phase_log
+from .tools.phase_replay import PhaseReplayConfig, prepare_replay_workspace
 from .tools.scaffold import ensure_project_scaffold
 from .tools.vcs import GitError, GitRepository
+from .utils.slug import slugify
 
 APP_HELP = "Agentic Engineer CLI entry point."
 DEFAULT_CONFIG_NAME = "config.yaml"
@@ -39,9 +43,9 @@ DEFAULT_CONFIG_TEMPLATE: Dict[str, Any] = {
     },
     "iteration": {
         "current": 0,
-        "max_calls": 50,
-        "max_cycles": 5,
-        "backoff_ms": 0,
+        "max_calls": 300,
+        "max_cycles": 20,
+        "backoff_ms": 500,
         "enable_autofix": True,
         "goal": "",
         "plan_id": "",
@@ -67,6 +71,8 @@ DEFAULT_CONFIG_TEMPLATE: Dict[str, Any] = {
         "auto_clean": {
             "enabled": True,
             "include_untracked": True,
+            "max_workspaces": 5,
+            "retention_hours": 24,
             "message_template": "ae:auto-clean:{task_slug}-{timestamp}",
         },
         "auto_push": {
@@ -78,20 +84,22 @@ DEFAULT_CONFIG_TEMPLATE: Dict[str, Any] = {
     },
     "context": {
         "guidance": [
-            "Operate as the sole engineer: make decisions independently, avoid asking questions, and capture any assumptions in your final summary.",
-            "Treat config.yaml and pyproject.toml as read-only, dont change them.",
-            "Do not create standalone planning or decision documents; capture rationale in concise inline comments only where it clarifies complex code, and summarize key decisions at the end of each run.",
-            "Reconstruct the current state from repository files each iteration and restate critical decisions in your final summary so later cycles inherit the context.",
-            "Structure implementation code under src/ with corresponding tests under tests/, and reorganize modules when it materially improves maintainability.",
-            "Always add or update automated tests under tests/ when modifying source code; create new test files when needed.",
-            "Assume commands execute inside your workspace clone; keep test paths and file operations relative to the repository root.",
-            "Remember that git commands only reflect committed state; inspect files directly in the workspace to account for uncommitted edits.",
-            "Review existing file contents before editing; prefer focused diffs yet perform broader rewrites when the narrower approach would be brittle.",
-            "If you need any dependencies put them in requirements.txt and they wil be installed automatically.",
-            "The repo includes a /data folder where you have a workspace, this is ignored by git intentionally, dont try to change this. NEVER use this folder for any storage, make a new folder with a different name instead.",
-            "Do NOT run pytest commands, these will run automatically on the tests you create.",
-            "When building CLIs with argparse, avoid add_subparsers for command dispatch; argparse exits on unknown subcommands before custom handlers run, so implement manual routing that can surface friendly error messages.",
+            "Act as the sole engineer, make decisions independently, avoid questions, and record assumptions in your final summary.",
+            "Treat config.yaml and pyproject.toml as read-only.",
+            "Do not create separate planning docs; use concise inline comments only where needed and summarize key decisions at the end of each run.",
+            "Rebuild state from repo files each iteration and restate critical decisions so future cycles inherit context.",
+            "Place code in src/ and tests in tests/; reorganize modules only when it improves maintainability.",
+            "Always add or update automated tests when changing code; create new test files as needed.",
+            "Assume commands run in the workspace clone; use repo-root-relative paths for files and tests.",
+            "Git shows committed state only inspect files directly for uncommitted edits.",
+            "Review files before editing; prefer focused diffs unless a broader rewrite is more robust.",
+            "Add dependencies to requirements.txt for automatic installation.",
+            "The /data folder is ignored by git and reserved for workspace use, never store files there, use a new folder instead.",
+            "Do NOT run pytest; tests run automatically.",
+            "When using argparse for CLIs, avoid add_subparsers; implement manual routing to handle unknown commands gracefully.",
+            "You have created all the code in the repository so don't be scared to delete files and folders if they are redundant, or not needed."
         ]
+
     },
     "paths": {
         "data": "data",
@@ -283,6 +291,36 @@ def _resolve_repo_root(config: Dict[str, Any], config_path: Path) -> Path:
     return repo_root_path
 
 
+def _resolve_data_root(config: Dict[str, Any], config_path: Path, repo_root: Path) -> Path:
+    """Resolve the data root directory for the current configuration."""
+
+    paths_cfg = config.get("paths") or {}
+    data_value = paths_cfg.get("data")
+    if isinstance(data_value, str) and data_value.strip():
+        candidate = Path(data_value.strip())
+        if not candidate.is_absolute():
+            candidate = (repo_root / candidate).resolve()
+        return candidate
+
+    # Fallback to ContextBuilder defaults to handle legacy configs.
+    builder = ContextBuilder.from_config(config, repo_root=repo_root)
+    return Path(builder.data_root).resolve()
+
+
+def _default_replay_identifier(phase: str, plan_id: Optional[str], task_id: Optional[str]) -> str:
+    """Construct a stable identifier for replay workspaces."""
+
+    parts: list[str] = []
+    if phase:
+        parts.append(phase)
+    if plan_id:
+        parts.append(plan_id)
+    if task_id:
+        parts.append(task_id)
+    label = "-".join(parts) if parts else "phase-replay"
+    return slugify(label, fallback="phase-replay", lowercase=True)
+
+
 def _ensure_initial_commit(config: Dict[str, Any], config_path: Path) -> None:
     """Create an empty initial commit when the repository has no HEAD."""
 
@@ -309,32 +347,60 @@ def _ensure_initial_commit(config: Dict[str, Any], config_path: Path) -> None:
         typer.echo(f"Details: {error}")
 
 
+def _refresh_code_index(config: Dict[str, Any], config_path: Path) -> List[Path]:
+    """Update the code index using the configured repository/data roots."""
+
+    indexer = CodeIndexer.from_config(config, config_path.resolve())
+    return indexer.reindex()
+
+
 def _build_client(config: Dict[str, Any], *, use_remote: bool) -> LLMClient:
     """Select either the real GPT-5 client or the offline stub."""
     models_cfg = config.get("models") or {}
     model_name = str(models_cfg.get("default", "gpt-5-nano"))
+    model_name_key = model_name.lower()
+    offline_model = model_name_key in {"offline", "gpt-5-offline"} or model_name_key.endswith(
+        "-offline"
+    )
 
-    if use_remote:
+    if use_remote and not offline_model:
+        typer.echo(f"Using GPT-5 client ({model_name}).")
+        client_kwargs: Dict[str, Any] = {}
+        timeout_value = models_cfg.get("timeout")
+        if isinstance(timeout_value, (int, float)) and timeout_value > 0:
+            client_kwargs["timeout"] = float(timeout_value)
+        max_attempts_value = models_cfg.get("max_attempts")
+        if isinstance(max_attempts_value, int) and max_attempts_value > 0:
+            client_kwargs["max_attempts"] = max_attempts_value
+        retry_delay_value = models_cfg.get("retry_delay")
+        if isinstance(retry_delay_value, (int, float)) and retry_delay_value >= 0:
+            client_kwargs["retry_delay"] = float(retry_delay_value)
+        base_url_value = models_cfg.get("base_url")
+        if isinstance(base_url_value, str) and base_url_value.strip():
+            client_kwargs["base_url"] = base_url_value.strip()
+        api_key_value = models_cfg.get("api_key")
+        if isinstance(api_key_value, str) and api_key_value.strip():
+            client_kwargs["api_key"] = api_key_value.strip()
         try:
-            typer.echo(f"Using GPT-5 client ({model_name}).")
-            client_kwargs: Dict[str, Any] = {}
-            timeout_value = models_cfg.get("timeout")
-            if isinstance(timeout_value, (int, float)) and timeout_value > 0:
-                client_kwargs["timeout"] = float(timeout_value)
-            max_attempts_value = models_cfg.get("max_attempts")
-            if isinstance(max_attempts_value, int) and max_attempts_value > 0:
-                client_kwargs["max_attempts"] = max_attempts_value
-            retry_delay_value = models_cfg.get("retry_delay")
-            if isinstance(retry_delay_value, (int, float)) and retry_delay_value >= 0:
-                client_kwargs["retry_delay"] = float(retry_delay_value)
-            base_url_value = models_cfg.get("base_url")
-            if isinstance(base_url_value, str) and base_url_value.strip():
-                client_kwargs["base_url"] = base_url_value.strip()
             return GPT5Client(model=model_name, **client_kwargs)
-        except (ValueError, LLMClientError) as error:
-            typer.echo(f"Falling back to offline stub: {error}")
+        except ValueError as error:
+            message = str(error)
+            if "api key" in message.lower():
+                typer.echo(
+                    "No API key given. Set OPENAI_API_KEY or GPT5_API_KEY, "
+                    "or re-run with --no-use-remote to use the offline stub."
+                )
+            else:
+                typer.echo(f"Failed to initialise GPT-5 client: {error}")
+            raise typer.Exit(code=1)
+        except LLMClientError as error:
+            typer.echo(f"Failed to initialise GPT-5 client: {error}")
+            raise typer.Exit(code=1)
 
-    typer.echo("Using offline stub client.")
+    if use_remote and offline_model:
+        typer.echo(f"Model '{model_name}' is offline-only; using offline stub client.")
+    else:
+        typer.echo("Using offline stub client.")
     return _OfflineLLMClient()
 
 
@@ -344,19 +410,20 @@ def _sample_iteration_plan(config: Dict[str, Any]) -> CodingIterationPlan:
     goal = str(iteration.get("goal", "bootstrap"))
     plan_id = str(iteration.get("plan_id", "demo-plan"))
     task_id = "TASK-0001"
+    product_spec = "### Product Vision\n- Goal: bootstrap\n- Current task: TASK-0001 demo"
     analyze = AnalyzeRequest(
         task_id=task_id,
         goal=goal,
         context="Sample repository state summary.",
         constraints=["Stay within coding guidelines."],
-        questions=["Are there hidden dependencies?"],
+        product_spec=product_spec,
     )
     design = DesignRequest(
         task_id=task_id,
         goal=goal,
         proposed_interfaces=["ae.router.PhaseRouter"],
-        open_questions=["Do we need additional hooks?"],
         constraints=["Remain backwards compatible with the CLI."],
+        product_spec=product_spec,
     )
     implement = ImplementRequest(
         task_id=task_id,
@@ -364,6 +431,7 @@ def _sample_iteration_plan(config: Dict[str, Any]) -> CodingIterationPlan:
         touched_files=["src/ae/cli.py"],
         test_plan=[],
         notes=["Focus on non-destructive changes."],
+        product_spec=product_spec,
     )
     return CodingIterationPlan(analyze=analyze, design=design, implement=implement, plan_id=plan_id)
 
@@ -461,7 +529,9 @@ def _render_plan_execution(summary: PlanExecutionSummary) -> None:
         if outcome.follow_up_tasks:
             typer.echo("    new tasks:")
             for follow_up in outcome.follow_up_tasks:
-                typer.echo(f"      - {follow_up.id}: {follow_up.title}")
+                status = follow_up.status.value
+                depends = f" (waits on {', '.join(follow_up.depends_on)})" if follow_up.depends_on else ""
+                typer.echo(f"      - [{status}] {follow_up.id}: {follow_up.title}{depends}")
 
         if outcome.result.artifact_path:
             typer.echo(f"    artifact: {outcome.result.artifact_path.as_posix()}")
@@ -469,6 +539,11 @@ def _render_plan_execution(summary: PlanExecutionSummary) -> None:
     typer.echo(f"Plan status: {summary.plan.status}")
     if summary.completed:
         typer.echo("Goal achieved: plan marked complete.")
+    if summary.tasks:
+        typer.echo("Task backlog:")
+        for task in summary.tasks:
+            depends = f" (waits on {', '.join(task.depends_on)})" if task.depends_on else ""
+            typer.echo(f"    - [{task.status.value}] {task.id}: {task.title}{depends}")
 
 
 def _select_plan(store: MemoryStore, plan_id_hint: Optional[str]) -> Optional[Plan]:
@@ -583,7 +658,6 @@ class _OfflineLLMClient(LLMClient):
 
         if phase == PhaseName.ANALYZE.value:
             constraints = request.get("constraints") or []
-            questions = request.get("questions") or []
             return {
                 "summary": f"Analyze task {request.get('task_id', 'TASK')} targeting {request.get('goal', 'goal')}.",
                 "plan_steps": [
@@ -591,7 +665,6 @@ class _OfflineLLMClient(LLMClient):
                     "Outline implementation approach tied to the goal.",
                 ],
                 "risks": [f"Constraint: {item}" for item in constraints],
-                "open_questions": questions,
             }
 
         if phase == PhaseName.DESIGN.value:
@@ -688,11 +761,12 @@ class _OfflineLLMClient(LLMClient):
             return {
                 "adjustments": adjustments,
                 "new_tasks": [f"Follow up on {item}" for item in blockers],
+                "drop_tasks": [],
                 "risks": ["Schedule slip"] if blockers else [],
                 "notes": [request.get("reason", "No stated reason.")],
             }
 
-        return {"summary": "Unsupported phase.", "plan_steps": [], "risks": [], "open_questions": []}
+        return {"summary": "Unsupported phase.", "plan_steps": [], "risks": []}
 
 @app.command()
 def init(
@@ -766,12 +840,10 @@ def init(
     goal_candidate = goal or iteration_cfg.get("goal")
     goal_text = str(goal_candidate).strip() if goal_candidate is not None else ""
     if not goal_text:
-        while True:
-            entered = typer.prompt("Top-level goal for this plan")
-            if str(entered).strip():
-                goal_text = str(entered).strip()
-                break
-            typer.echo("Goal cannot be empty. Please provide a goal.")
+        raise typer.BadParameter(
+            "A goal is required. Provide --goal or set iteration.goal in the config.",
+            param_hint="--goal",
+        )
 
     if goal_text != str(iteration_cfg.get("goal") or "").strip():
         iteration_cfg["goal"] = goal_text
@@ -862,6 +934,12 @@ def init(
 
     _ensure_initial_commit(config_data, config_path)
 
+    index_updates = _refresh_code_index(config_data, config_path)
+    if index_updates:
+        typer.echo(f"Refreshed code index ({len(index_updates)} file(s) processed).")
+    else:
+        typer.echo("Code index already up to date.")
+
     if not plan:
         typer.echo("Repository ready. Re-run with --plan to generate planning artifacts.")
         return
@@ -915,8 +993,7 @@ def index(
     config_path = Path(config)
     config_data = load_config(config_path)
 
-    indexer = CodeIndexer.from_config(config_data, config_path.resolve())
-    processed = indexer.reindex()
+    processed = _refresh_code_index(config_data, config_path)
     if processed:
         typer.echo(f"Indexed {len(processed)} file(s):")
         for path in processed:
@@ -942,6 +1019,11 @@ def iterate(
     """Run a sample coding iteration using the core orchestrator wiring."""
     config_path = Path(config)
     config_data = load_config(config_path)
+    iteration_cfg = config_data.setdefault("iteration", {})
+
+    index_updates = _refresh_code_index(config_data, config_path)
+    if index_updates:
+        typer.echo(f"Refreshed code index ({len(index_updates)} file(s) processed).")
 
     client = _build_client(config_data, use_remote=use_remote)
     orchestrator = Orchestrator.from_client(
@@ -952,7 +1034,7 @@ def iterate(
 
     typer.echo("Running plan-driven iteration loop...")
 
-    plan_hint = (config_data.get("iteration") or {}).get("plan_id")
+    plan_hint = iteration_cfg.get("plan_id")
     plan_id = str(plan_hint).strip() if isinstance(plan_hint, str) and plan_hint.strip() else None
 
     with MemoryStore.from_config(config_data) as store:
@@ -960,18 +1042,117 @@ def iterate(
             store,
             orchestrator,
             config_path=config_path,
+            config=config_data,
             revert_on_exit=False,
         )
         summary = executor.execute(plan_id=plan_id)
 
-    if summary is None:
-        typer.echo("No plan found in memory. Running sample iteration (non-destructive demonstration)...")
-        plan = _sample_iteration_plan(config_data)
-        result = orchestrator.run_coding_iteration(plan, config_path=config_path)
-        _render_iteration_result(result)
-        return
+        if summary is None:
+            goal_text = str(iteration_cfg.get("goal") or "").strip()
+            if not goal_text:
+                typer.echo(
+                    "No plan found and no iteration goal configured. "
+                    "Run `ae init --plan --goal \"...\"` or set iteration.goal in the config."
+                )
+                raise typer.Exit(code=1)
+
+            repo_root = _resolve_repo_root(config_data, config_path)
+            typer.echo("No plan found in memory. Bootstrapping a plan automatically...")
+            artifacts = bootstrap_initial_plan(
+                store,
+                config_data,
+                client,
+                goal=goal_text,
+                repo_root=repo_root,
+                config_path=config_path,
+            )
+            new_plan_id = artifacts.plan.id
+            if str(iteration_cfg.get("plan_id") or "").strip() != new_plan_id:
+                iteration_cfg["plan_id"] = new_plan_id
+                _write_config(config_path, config_data)
+                typer.echo(f"Recorded plan ID {new_plan_id} in {config_path}.")
+            store.reopen()
+            summary = executor.execute(plan_id=new_plan_id)
+
+        if summary is None:
+            typer.echo(
+                "Plan bootstrap failed to produce an executable plan. "
+                "Inspect the planning store and configuration."
+            )
+            raise typer.Exit(code=1)
 
     _render_plan_execution(summary)
+
+
+@app.command()
+def replay_phase(
+    log_path: Path = typer.Argument(..., help="Path to a stored phase log JSON file."),
+    config: str = typer.Option(
+        DEFAULT_CONFIG_NAME,
+        "--config",
+        "-c",
+        help="Path to the agent configuration file.",
+    ),
+    restore_workspace: bool = typer.Option(
+        True,
+        "--restore-workspace/--no-restore-workspace",
+        help="Apply the recorded workspace snapshot when available.",
+    ),
+    keep_existing: bool = typer.Option(
+        False,
+        "--keep-existing",
+        help="Fail if the replay workspace already exists instead of replacing it.",
+    ),
+    label: Optional[str] = typer.Option(
+        None,
+        "--label",
+        help="Optional identifier used when naming the replay workspace directory.",
+    ),
+) -> None:
+    """Materialise a replay workspace for a stored phase log."""
+
+    config_path = Path(config)
+    config_data = load_config(config_path)
+    repo_root = _resolve_repo_root(config_data, config_path)
+    data_root = _resolve_data_root(config_data, config_path, repo_root)
+
+    log_entry = load_phase_log(log_path)
+    identifier = label.strip() if isinstance(label, str) and label else None
+    if not identifier:
+        identifier = _default_replay_identifier(log_entry.phase, log_entry.plan_id, log_entry.task_id)
+
+    try:
+        repo = GitRepository(repo_root)
+    except GitError as error:
+        typer.echo(f"Failed to open repository at {repo_root}: {error}")
+        raise typer.Exit(code=1)
+
+    replay_config = PhaseReplayConfig(
+        repo=repo,
+        data_root=data_root,
+        keep_existing=keep_existing,
+        identifier=identifier,
+    )
+
+    try:
+        workspace = prepare_replay_workspace(
+            replay_config,
+            log_entry,
+            apply_snapshot=restore_workspace,
+            allow_partial=True,
+        )
+    except (GitError, FileExistsError) as error:
+        typer.echo(f"Unable to create replay workspace: {error}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Replay workspace available at {workspace.root}")
+    if restore_workspace:
+        if workspace.snapshot_applied:
+            typer.echo("Applied workspace snapshot from log metadata.")
+        else:
+            typer.echo("Log does not include a workspace snapshot; using a clean clone.")
+    else:
+        typer.echo("Workspace snapshot application disabled by flag.")
 
 
 @app.command()

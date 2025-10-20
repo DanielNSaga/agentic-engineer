@@ -150,7 +150,7 @@ class PlannerAnalysisComponent(BaseModel):
     )
     risks: List[str] = Field(
         default_factory=list,
-        description="Component-specific risks or edge cases.",
+        description="Component-specific risks.",
     )
 
 
@@ -168,10 +168,6 @@ class PlannerAnalysis(BaseModel):
     validation_assets: List[str] = Field(
         default_factory=list,
         description="Existing tests, scripts, or commands useful for validation.",
-    )
-    knowledge_gaps: List[str] = Field(
-        default_factory=list,
-        description="Open questions or missing context blocking execution.",
     )
     risks: List[PlannerRisk] = Field(
         default_factory=list,

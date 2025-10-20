@@ -51,6 +51,7 @@ class _StructuredFileState:
     content: str
     encoding: str | None = None
     executable: bool | None = None
+    deleted: bool = False
 
 
 TELEMETRY_LOGGER = logging.getLogger("ae.telemetry")
@@ -643,13 +644,13 @@ def _join_lines(lines: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _apply_structured_operation(base_text: str, operation: Any) -> str:
-    """Apply a structured edit operation to the provided text."""
+def _apply_structured_operation(state: _StructuredFileState, operation: Any) -> None:
+    """Apply a structured edit operation to the provided file state."""
     action = (getattr(operation, "action", "") or "").lower()
     if action not in {"replace", "insert", "delete"}:
-        return base_text
+        return
 
-    lines = _split_lines(base_text)
+    lines = _split_lines(state.content)
 
     if action == "replace":
         start_line = getattr(operation, "start_line", None) or 1
@@ -666,27 +667,32 @@ def _apply_structured_operation(base_text: str, operation: Any) -> str:
         if slice_end < start_index:
             slice_end = start_index
         lines[start_index:slice_end] = replacement_lines
+        state.deleted = False
     elif action == "insert":
         insertion_lines = _split_lines(getattr(operation, "content", None))
         if not insertion_lines:
-            return base_text
+            return
         start_line = getattr(operation, "start_line", None)
         index = start_line - 1 if isinstance(start_line, int) and start_line > 0 else len(lines)
         index = max(0, min(index, len(lines)))
         lines[index:index] = insertion_lines
+        state.deleted = False
     elif action == "delete":
         start_line = getattr(operation, "start_line", None)
         end_line = getattr(operation, "end_line", None)
         if start_line is None and end_line is None:
-            lines = []
+            state.content = ""
+            state.deleted = state.existed
+            return
         else:
             start = start_line if isinstance(start_line, int) and start_line > 0 else 1
             end_bound = end_line if isinstance(end_line, int) and end_line > 0 else start
             start_index = max(start - 1, 0)
             slice_end = min(max(end_bound, start), len(lines))
             del lines[start_index:slice_end]
+            state.deleted = False
 
-    return _join_lines(lines)
+    state.content = _join_lines(lines)
 
 
 def _load_original_text(repo_root: Path, path: str) -> tuple[str, bool]:
@@ -730,6 +736,7 @@ def _collect_structured_updates(
             continue
         state = ensure_state(path)
         state.content = _normalise_structured_content(getattr(artifact, "content", None))
+        state.deleted = False
         encoding = getattr(artifact, "encoding", None)
         if isinstance(encoding, str) and encoding.strip():
             state.encoding = encoding.strip()
@@ -742,10 +749,13 @@ def _collect_structured_updates(
         if not path:
             continue
         state = ensure_state(path)
-        state.content = _apply_structured_operation(state.content, edit)
+        _apply_structured_operation(state, edit)
 
     updates: dict[str, _StructuredFileState] = {}
     for path, state in states.items():
+        if state.deleted:
+            updates[path] = state
+            continue
         if state.content == state.original:
             continue
         updates[path] = state
@@ -790,6 +800,13 @@ def _write_structured_updates(worktree_root: Path, updates: Mapping[str, _Struct
             target.relative_to(root)
         except ValueError:
             raise PatchError(f"Structured edit escaped worktree: {path}") from None
+        if state.deleted:
+            if target.exists() or target.is_symlink():
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         encoding = state.encoding or "utf-8"
         data = state.content.encode(encoding, errors="replace")

@@ -585,6 +585,7 @@ def _create_precompliant_scaffold(
             ".pytest_cache/\n"
             "*.py[cod]\n"
             ".coverage\n"
+            "*.pre_patch\n"
         ),
         root / "README.md": _PRECOMPLIANT_README_TEMPLATE.format(
             project_title=title,

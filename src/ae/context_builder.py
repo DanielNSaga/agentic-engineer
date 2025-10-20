@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from . import prompts
+from .memory.code_index.embeddings import EmbeddingsIndex
+from .memory.code_index.graph_index import GraphIndex
 from .memory.code_index.symbol_index import SymbolIndex, SymbolRecord
 from .phases import PhaseName
 from .tools.snippets import SnippetRequest, collect_snippets, normalize_static_findings
@@ -35,6 +37,9 @@ class ContextBuilder:
     _MAX_SYMBOL_SNIPPETS = 10
     _MAX_SNIPPETS_PER_FILE = 3
     _MAX_FILE_PREVIEW_CHARS = 1_200
+    _MAX_EMBEDDING_MATCHES = 6
+    _MAX_DEPENDENCY_PREVIEW = 3
+    _EMBEDDING_PHASES = {"plan", "plan_adjust"}
     _STATIC_FINDING_CONTEXT = 10
     _REPO_FILE_LIMIT = 0
     _REPO_TREE_LINE_LIMIT = 0
@@ -69,9 +74,57 @@ class ContextBuilder:
         "touched_files",
         "touched_paths",
         "suspect_files",
+        "related_files",
     }
     _REQUEST_TEST_ID_KEYS = {"failing_tests"}
     _PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-\\/]+\.py")
+    _PYTHON_FILE_SUFFIXES = {".py", ".pyi"}
+    _SNIPPET_LANGUAGE_MAP = {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".toml": "toml",
+        ".md": "markdown",
+        ".sh": "bash",
+        ".bash": "bash",
+        ".zsh": "bash",
+        ".ps1": "powershell",
+        ".go": "go",
+        ".rs": "rust",
+        ".java": "java",
+        ".c": "c",
+        ".h": "c",
+        ".cpp": "cpp",
+        ".cc": "cpp",
+        ".hpp": "cpp",
+        ".hh": "cpp",
+        ".cs": "csharp",
+        ".rb": "ruby",
+        ".php": "php",
+        ".kt": "kotlin",
+        ".swift": "swift",
+        ".sql": "sql",
+        ".ini": "ini",
+        ".cfg": "ini",
+        ".conf": "ini",
+        ".html": "html",
+        ".htm": "html",
+        ".css": "css",
+        ".xml": "xml",
+        ".diff": "diff",
+        ".patch": "diff",
+        ".txt": "text",
+    }
+    _SNIPPET_NAME_LANGUAGE_MAP = {
+        "makefile": "makefile",
+        "dockerfile": "dockerfile",
+        "caddyfile": "caddyfile",
+    }
 
     def __init__(
         self,
@@ -86,8 +139,9 @@ class ContextBuilder:
     ) -> None:
         self._policy_text = policy_text or ""
         self._system_preamble = system_preamble or (
-            "You are Agentic Engineer, a meticulous coding assistant. "
-            "Always return well-formed JSON that matches the expected schema."
+            "You are an expert software engineer. "
+            "You always return well-formed JSON that matches the expected schema."
+            "You always plan your steps to get the highest quality solutions."
         )
         self._token_budget = token_budget or self.DEFAULT_TOKEN_BUDGET
         self._repo_root = self._resolve_repo_root(repo_root)
@@ -95,9 +149,18 @@ class ContextBuilder:
         self._logs_root = self._resolve_logs_root(logs_root, self._data_root, self._repo_root)
         self._index_root = self._data_root / "index"
         self._symbol_index_path = self._index_root / "symbols.json"
+        self._embedding_index_path = self._index_root / "embeddings.json"
+        self._graph_index_path = self._index_root / "graph.json"
         self._symbol_index: SymbolIndex | None = None
         self._symbol_index_loaded = False
+        self._embedding_index: EmbeddingsIndex | None = None
+        self._embedding_index_loaded = False
+        self._graph_index: GraphIndex | None = None
+        self._graph_index_loaded = False
         self._repo_file_cache: list[tuple[str, bool]] | None = None
+        self._workspace_outline_cache: str | None = None
+        self._workspace_repo_tree_cache: str | None = None
+        self._workspace_requirements_cache: str | None = None
         cleaned_guidance: list[str] = []
         for item in guidance or ():
             if isinstance(item, str):
@@ -167,61 +230,70 @@ class ContextBuilder:
     def build(self, phase: str, request: Any) -> ContextPackage:
         """Assemble a bounded context package for the given phase request."""
         request_data = self._coerce_data(request)
+        internal_metadata: dict[str, Any] = {}
+        for key in ("workspace_state",):
+            if key in request_data:
+                internal_metadata[key] = request_data.pop(key)
         snippets = self._extract_snippets(request_data)
         symbol_hints = self._extract_symbol_hints(request_data)
-        file_hints = self._extract_file_hints(request_data)
+        embedding_matches = self._prepare_embedding_matches(phase, request_data)
+        file_hints = self._extract_file_hints(
+            request_data,
+            embedding_matches=embedding_matches,
+        )
         payload_view = self._prepare_payload_view(request_data, snippets)
 
-        sections = self._collect_sections(
+        sections, consumed_payload_keys = self._collect_sections(
             phase,
             payload_view,
             symbol_hints=symbol_hints,
             file_hints=file_hints,
             snippets=snippets,
+            embedding_matches=embedding_matches,
         )
+
+        payload_section = self._render_payload(payload_view, omit_keys=consumed_payload_keys)
+        if payload_section:
+            sections.append(
+                {
+                    "label": "request_payload",
+                    "text": payload_section,
+                    "priority": 60,
+                    "allow_truncate": True,
+                }
+            )
 
         instructions_text = prompts.render_json_instruction(self._repo_root)
         instruction_tokens = self._estimate_tokens(instructions_text)
         budget_for_sections = max(self._token_budget - instruction_tokens, 0)
 
-        prompt_body, section_meta, token_estimate = self._assemble_prompt(sections, budget=budget_for_sections)
+        prompt_body, section_meta, section_token_estimate = self._assemble_prompt(
+            sections,
+            budget=budget_for_sections,
+        )
 
-        remaining_budget = max(self._token_budget - token_estimate, 0)
-        instructions_entry = {
-            "label": "instructions",
-            "included": False,
-            "truncated": False,
-            "tokens": 0,
-        }
-        instruction_text_used = ""
-        if instruction_tokens <= remaining_budget:
-            instruction_text_used = instructions_text
-            instructions_entry["included"] = True
-            instructions_entry["tokens"] = instruction_tokens
-        elif remaining_budget > 0:
-            instruction_text_used = self._truncate_text_to_tokens(instructions_text, remaining_budget)
-            if instruction_text_used:
-                instructions_entry["included"] = True
-                instructions_entry["truncated"] = True
-                instructions_entry["tokens"] = self._estimate_tokens(instruction_text_used)
+        system_prompt = self._compose_system_prompt(phase, instructions_text)
+        user_prompt = prompt_body.strip()
 
-        if instruction_text_used:
-            token_estimate += instructions_entry["tokens"]
-            if prompt_body:
-                user_prompt = f"{prompt_body.strip()}\n\n{instruction_text_used.strip()}"
-            else:
-                user_prompt = instruction_text_used.strip()
-        else:
-            user_prompt = prompt_body.strip()
+        total_token_estimate = section_token_estimate + instruction_tokens
+        if instructions_text:
+            section_meta.append(
+                {
+                    "label": "instructions",
+                    "included": True,
+                    "truncated": False,
+                    "tokens": instruction_tokens,
+                    "location": "system_prompt",
+                }
+            )
 
-        section_meta.append(instructions_entry)
+        embedding_metadata = self._serialize_embedding_matches(embedding_matches)
 
-        system_prompt = self._compose_system_prompt(phase)
         metadata: dict[str, Any] = {
             "phase": phase,
             "request": payload_view,
             "token_budget": self._token_budget,
-            "token_estimate": min(token_estimate, self._token_budget),
+            "token_estimate": min(total_token_estimate, self._token_budget),
             "sections": section_meta,
         }
         if symbol_hints:
@@ -240,6 +312,10 @@ class ContextBuilder:
                 }
                 for entry in snippets
             ]
+        if embedding_metadata:
+            metadata["embedding_matches"] = embedding_metadata
+        if internal_metadata:
+            metadata.update(internal_metadata)
 
         return ContextPackage(
             system_prompt=system_prompt,
@@ -247,15 +323,17 @@ class ContextBuilder:
             metadata=metadata,
         )
 
-    def _compose_system_prompt(self, phase: str) -> str:
-        if not self._policy_text:
-            return f"{self._system_preamble} You are currently executing the {phase} phase."
-
-        return (
-            f"{self._system_preamble} You are currently executing the {phase} phase.\n\n"
-            "## Repository Policy Capsule\n"
-            f"{self._policy_text}"
-        )
+    def _compose_system_prompt(self, phase: str, instructions: str) -> str:
+        base_prompt = f"{self._system_preamble} You are currently executing the {phase} phase."
+        if self._policy_text:
+            base_prompt = (
+                f"{base_prompt}\n\n"
+                "## Repository Policy Capsule\n"
+                f"{self._policy_text}"
+            )
+        if instructions:
+            base_prompt = f"{base_prompt}\n\n## Response Instructions\n{instructions.strip()}"
+        return base_prompt
 
     @property
     def repo_root(self) -> Path:
@@ -272,6 +350,14 @@ class ContextBuilder:
         """Return the logs directory derived from the data root."""
         return self._logs_root
 
+    @classmethod
+    def _is_python_file(cls, path: str | None) -> bool:
+        """Return True when the provided path points to a Python source file."""
+        if not isinstance(path, str):
+            return False
+        suffix = Path(path.strip()).suffix.lower()
+        return suffix in cls._PYTHON_FILE_SUFFIXES
+
     def _coerce_data(self, request: Any) -> dict[str, Any]:
         """Normalize request objects to dictionaries."""
         if is_dataclass(request):
@@ -284,6 +370,21 @@ class ContextBuilder:
         raw = request_data.get("snippets")
 
         snippets: list[dict[str, Any]] = []
+        snippet_index_by_path: dict[str, int] = {}
+
+        def _upsert_snippet(entry: dict[str, Any]) -> None:
+            path = entry["path"]
+            existing_index = snippet_index_by_path.get(path)
+            if existing_index is None:
+                snippet_index_by_path[path] = len(snippets)
+                snippets.append(entry)
+            else:
+                existing_entry = snippets[existing_index]
+                if "reason" not in entry and "reason" in existing_entry:
+                    entry = dict(entry)
+                    entry["reason"] = existing_entry["reason"]
+                snippets[existing_index] = entry
+
         if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
             for item in raw:
                 if not isinstance(item, Mapping):
@@ -292,8 +393,9 @@ class ContextBuilder:
                 content = item.get("content")
                 if not isinstance(path, str) or not isinstance(content, str):
                     continue
+                cleaned_path = path.strip()
                 snippet_entry: dict[str, Any] = {
-                    "path": path.strip(),
+                    "path": cleaned_path,
                     "content": content,
                 }
                 start_line = item.get("start_line")
@@ -305,11 +407,22 @@ class ContextBuilder:
                     snippet_entry["end_line"] = end_line
                 if isinstance(reason, str) and reason.strip():
                     snippet_entry["reason"] = reason.strip()
-                snippets.append(snippet_entry)
+                _upsert_snippet(snippet_entry)
 
-        snippet_keys = {
-            (entry["path"], entry.get("start_line"), entry.get("end_line")) for entry in snippets
-        }
+        existing_keys: set[tuple[str, int | None, int | None]] = set()
+        for entry in snippets:
+            path_value = entry.get("path")
+            if not isinstance(path_value, str):
+                continue
+            cleaned_path = path_value.strip()
+            start_val = entry.get("start_line")
+            end_val = entry.get("end_line")
+            start_key = start_val if isinstance(start_val, int) and start_val > 0 else None
+            end_key = end_val if isinstance(end_val, int) and end_val > 0 else None
+            key = (cleaned_path, start_key, end_key)
+            existing_keys.add(key)
+            if start_key is None and end_key is None:
+                existing_keys.add((cleaned_path, None, None))
 
         code_requests_raw = request_data.get("code_requests")
         static_findings_raw = request_data.get("static_findings")
@@ -325,22 +438,49 @@ class ContextBuilder:
                 path = item.get("path")
                 if not isinstance(path, str):
                     continue
+                cleaned_path = path.strip()
+                if not self._is_python_file(cleaned_path):
+                    continue
                 start_line = item.get("start_line")
                 end_line = item.get("end_line")
                 surround = item.get("surround")
                 reason = item.get("reason")
+                start_key = start_line if isinstance(start_line, int) and start_line > 0 else None
+                end_key = end_line if isinstance(end_line, int) and end_line > 0 else None
+                key = (cleaned_path, start_key, end_key)
+                if key in existing_keys or (cleaned_path, None, None) in existing_keys:
+                    continue
                 requests.append(
                     SnippetRequest(
-                        path=path.strip(),
-                        start_line=start_line if isinstance(start_line, int) and start_line > 0 else None,
-                        end_line=end_line if isinstance(end_line, int) and end_line > 0 else None,
+                        path=cleaned_path,
+                        start_line=start_key,
+                        end_line=end_key,
                         surround=surround if isinstance(surround, int) and surround >= 0 else None,
                         reason=reason if isinstance(reason, str) and reason.strip() else None,
                     )
                 )
+                existing_keys.add(key)
 
-        if requests or static_findings_raw:
-            normalized_findings = normalize_static_findings(static_findings_raw or [])
+        normalized_findings: list[Any] = []
+        if static_findings_raw:
+            raw_findings = [
+                finding
+                for finding in normalize_static_findings(static_findings_raw or [])
+                if self._is_python_file(finding.path)
+            ]
+            filtered_findings: list[Any] = []
+            for finding in raw_findings:
+                cleaned_path = finding.path.strip()
+                start_key = finding.line_start if finding.line_start > 0 else None
+                end_key = finding.line_end if finding.line_end > 0 else None
+                key = (cleaned_path, start_key, end_key)
+                if key in existing_keys or (cleaned_path, None, None) in existing_keys:
+                    continue
+                filtered_findings.append(finding)
+                existing_keys.add(key)
+            normalized_findings = filtered_findings
+
+        if requests or normalized_findings:
             extra_snippets = collect_snippets(
                 self._repo_root,
                 requests,
@@ -348,8 +488,7 @@ class ContextBuilder:
                 finding_context=self._STATIC_FINDING_CONTEXT,
             )
             for snippet in extra_snippets:
-                key = (snippet.path, snippet.start_line, snippet.end_line)
-                if key in snippet_keys:
+                if not self._is_python_file(snippet.path):
                     continue
                 snippet_entry = {
                     "path": snippet.path,
@@ -359,8 +498,7 @@ class ContextBuilder:
                 }
                 if snippet.reason:
                     snippet_entry["reason"] = snippet.reason
-                snippets.append(snippet_entry)
-                snippet_keys.add(key)
+                _upsert_snippet(snippet_entry)
 
         return snippets
 
@@ -392,7 +530,8 @@ class ContextBuilder:
         symbol_hints: set[str],
         file_hints: set[str],
         snippets: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+        embedding_matches: Sequence[Mapping[str, Any]] | None = None,
+    ) -> tuple[list[dict[str, Any]], set[str]]:
         if phase.lower() == "diagnose":
             return self._collect_diagnose_sections(
                 phase,
@@ -400,6 +539,7 @@ class ContextBuilder:
                 symbol_hints=symbol_hints,
                 file_hints=file_hints,
                 snippets=snippets,
+                embedding_matches=embedding_matches,
             )
 
         sections: list[dict[str, Any]] = [
@@ -417,7 +557,9 @@ class ContextBuilder:
             },
         ]
 
-        summary = self._render_task_summary(request_data)
+        consumed_keys: set[str] = set()
+
+        summary, summary_keys = self._render_task_summary(request_data)
         if summary:
             sections.append(
                 {
@@ -427,9 +569,23 @@ class ContextBuilder:
                     "allow_truncate": False,
                 }
             )
+            consumed_keys.update(summary_keys)
 
-        sections.extend(self._render_list_sections(request_data))
-        sections.extend(self._render_text_sections(request_data))
+        list_sections, list_keys = self._render_list_sections(request_data)
+        sections.extend(list_sections)
+        consumed_keys.update(list_keys)
+
+        text_sections, text_keys = self._render_text_sections(request_data)
+        sections.extend(text_sections)
+        consumed_keys.update(text_keys)
+
+        sections.extend(
+            self._render_embedding_sections(
+                phase,
+                request_data,
+                embedding_matches=embedding_matches,
+            )
+        )
 
         if self._guidance_lines:
             guidance_text = prompts.render_project_guidance(self._guidance_lines)
@@ -447,16 +603,8 @@ class ContextBuilder:
 
         snippet_sections = self._render_snippet_sections(snippets)
         sections.extend(snippet_sections)
-
-        payload = self._render_payload(request_data)
-        sections.append(
-            {
-                "label": "request_payload",
-                "text": payload,
-                "priority": 60,
-                "allow_truncate": True,
-            }
-        )
+        if snippet_sections:
+            consumed_keys.add("snippets")
 
         for label, text in self._response_contract_sections(phase, request_data):
             sections.append(
@@ -480,18 +628,28 @@ class ContextBuilder:
             )
             sections.extend(code_sections)
 
-        python_outline_section = self._render_workspace_python_outline_section()
-        if python_outline_section:
-            sections.append(
-                {
-                    "label": "workspace_python_outline",
-                    "text": python_outline_section,
-                    "priority": 68,
-                    "allow_truncate": False,
-                }
+        sections.extend(
+            self._workspace_snapshot_sections(
+                phase=phase,
+                file_hints=file_hints,
             )
+        )
 
-        requirements_section = self._render_requirements_section()
+        return sections, consumed_keys
+
+    def _workspace_snapshot_sections(self, *, phase: str, file_hints: set[str]) -> list[dict[str, Any]]:
+        phase_key = phase.lower()
+        full_snapshot_phases = {
+            PhaseName.PLAN.value,
+            PhaseName.ANALYZE.value,
+            PhaseName.DESIGN.value,
+            PhaseName.DIAGNOSE.value,
+        }
+        mode = "full" if phase_key in full_snapshot_phases else "focused"
+
+        sections: list[dict[str, Any]] = []
+
+        requirements_section = self._render_requirements_section(use_cache=True)
         if requirements_section:
             sections.append(
                 {
@@ -502,7 +660,46 @@ class ContextBuilder:
                 }
             )
 
-        repo_tree_section = self._render_repo_tree_section()
+        if mode == "full":
+            python_outline_section = self._render_workspace_python_outline_section(use_cache=True)
+            if python_outline_section:
+                sections.append(
+                    {
+                        "label": "workspace_python_outline",
+                        "text": python_outline_section,
+                        "priority": 68,
+                        "allow_truncate": False,
+                    }
+                )
+
+            repo_tree_section = self._render_repo_tree_section(use_cache=True)
+            if repo_tree_section:
+                sections.append(
+                    {
+                        "label": "repo_tree",
+                        "text": repo_tree_section,
+                        "priority": 72,
+                        "allow_truncate": False,
+                    }
+                )
+            return sections
+
+        targets = self._expand_snapshot_targets(file_hints)
+        if not targets:
+            return sections
+
+        python_outline_section = self._render_workspace_python_outline_section(limit_to=targets)
+        if python_outline_section:
+            sections.append(
+                {
+                    "label": "workspace_python_outline",
+                    "text": python_outline_section,
+                    "priority": 68,
+                    "allow_truncate": False,
+                }
+            )
+
+        repo_tree_section = self._render_repo_tree_section(limit_to=targets)
         if repo_tree_section:
             sections.append(
                 {
@@ -515,6 +712,38 @@ class ContextBuilder:
 
         return sections
 
+    def _expand_snapshot_targets(self, paths: set[str]) -> set[str]:
+        expanded: set[str] = set()
+        for raw in paths:
+            if not raw:
+                continue
+            normalized = raw.strip().strip("/")
+            if "\\" in normalized:
+                normalized = normalized.replace("\\", "/")
+            if not normalized:
+                continue
+            parts = Path(normalized).parts
+            for index in range(1, len(parts) + 1):
+                candidate = Path(*parts[:index]).as_posix()
+                expanded.add(candidate)
+        return expanded
+
+    @staticmethod
+    def _path_matches_targets(path: str, targets: set[str]) -> bool:
+        candidate = path.strip().strip("/")
+        if "\\" in candidate:
+            candidate = candidate.replace("\\", "/")
+        if not candidate:
+            return False
+        for target in targets:
+            if candidate == target:
+                return True
+            if candidate.startswith(f"{target}/"):
+                return True
+            if target.startswith(f"{candidate}/"):
+                return True
+        return False
+
     def _collect_diagnose_sections(
         self,
         phase: str,
@@ -523,10 +752,12 @@ class ContextBuilder:
         symbol_hints: set[str],
         file_hints: set[str],
         snippets: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+        embedding_matches: Sequence[Mapping[str, Any]] | None = None,
+    ) -> tuple[list[dict[str, Any]], set[str]]:
         """Assemble a compact prompt profile tuned for the diagnose phase."""
 
         sections: list[dict[str, Any]] = []
+        consumed_keys: set[str] = set()
 
         brief = self._render_phase_brief(phase)
         brief_single_line = " ".join(brief.split()) if brief else ""
@@ -542,7 +773,7 @@ class ContextBuilder:
             }
         )
 
-        summary = self._render_task_summary(request_data)
+        summary, summary_keys = self._render_task_summary(request_data)
         if summary:
             sections.append(
                 {
@@ -552,6 +783,7 @@ class ContextBuilder:
                     "allow_truncate": False,
                 }
             )
+            consumed_keys.update(summary_keys)
 
         compact_lines: list[str] = []
         compact_fields = [
@@ -560,14 +792,15 @@ class ContextBuilder:
             ("reason", "Reason"),
         ]
         for key, label in compact_fields:
+            if key in summary_keys:
+                continue
             value = request_data.get(key)
             if isinstance(value, str) and value.strip():
                 compact_lines.append(f"- {label}: {value.strip()}")
+                consumed_keys.add(key)
 
         list_field_map = {
             "constraints": "Constraints",
-            "questions": "Questions",
-            "open_questions": "Open Questions",
             "failing_tests": "Failing Tests",
             "recent_changes": "Recent Changes",
             "suggested_changes": "Suggested Changes",
@@ -579,6 +812,7 @@ class ContextBuilder:
             values = self._coerce_to_strings(request_data.get(key))
             if not values:
                 continue
+            consumed_keys.add(key)
             if len(values) == 1 and len(values[0]) <= 160:
                 compact_lines.append(f"- {label}: {values[0]}")
                 continue
@@ -607,18 +841,19 @@ class ContextBuilder:
                     "allow_truncate": True,
                 }
             )
+            consumed_keys.add("logs")
 
         snippet_sections = self._render_snippet_sections(snippets)
         sections.extend(snippet_sections)
+        if snippet_sections:
+            consumed_keys.add("snippets")
 
-        payload = self._render_payload(request_data)
-        sections.append(
-            {
-                "label": "request_payload",
-                "text": payload,
-                "priority": 60,
-                "allow_truncate": True,
-            }
+        sections.extend(
+            self._render_embedding_sections(
+                phase,
+                request_data,
+                embedding_matches=embedding_matches,
+            )
         )
 
         code_sections = self._render_code_sections(symbol_hints, file_hints, max_sections=5)
@@ -633,13 +868,21 @@ class ContextBuilder:
             )
             sections.extend(code_sections)
 
-        return sections
+        sections.extend(
+            self._workspace_snapshot_sections(
+                phase=phase,
+                file_hints=file_hints,
+            )
+        )
+
+        return sections, consumed_keys
 
     def _render_phase_brief(self, phase: str) -> str:
         return prompts.render_phase_brief(phase)
 
-    def _render_task_summary(self, request_data: dict[str, Any]) -> str:
+    def _render_task_summary(self, request_data: dict[str, Any]) -> tuple[str, set[str]]:
         bullets: list[str] = []
+        consumed: set[str] = set()
         task_id = request_data.get("task_id")
         plan_id = request_data.get("plan_id")
         goal = request_data.get("goal")
@@ -648,24 +891,30 @@ class ContextBuilder:
 
         if isinstance(task_id, str) and task_id:
             bullets.append(f"- Task ID: {task_id}")
+            consumed.add("task_id")
         if isinstance(plan_id, str) and plan_id:
             bullets.append(f"- Plan ID: {plan_id}")
+            consumed.add("plan_id")
         if isinstance(goal, str) and goal:
             bullets.append(f"- Goal: {goal}")
+            consumed.add("goal")
         if isinstance(diff_goal, str) and diff_goal:
             bullets.append(f"- Diff Goal: {diff_goal}")
+            consumed.add("diff_goal")
         if isinstance(reason, str) and reason:
             bullets.append(f"- Reason: {reason}")
+            consumed.add("reason")
 
         if not bullets:
-            return ""
-        return "## Task Summary\n" + "\n".join(bullets)
+            return "", set()
+        return "## Task Summary\n" + "\n".join(bullets), consumed
 
-    def _render_list_sections(self, request_data: dict[str, Any]) -> list[dict[str, Any]]:
+    def _render_list_sections(self, request_data: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
         list_fields = {
             "constraints": ("Constraints", 20),
-            "questions": ("Questions", 20),
-            "open_questions": ("Open Questions", 20),
+            "acceptance_criteria": ("Acceptance Criteria", 21),
+            "deliverables": ("Deliverables", 21),
+            "dependencies": ("Dependencies", 23),
             "test_plan": ("Test Plan", 25),
             "notes": ("Notes", 25),
             "violations": ("Policy Violations", 30),
@@ -676,9 +925,11 @@ class ContextBuilder:
             "proposed_interfaces": ("Proposed Interfaces", 25),
             "follow_up": ("Follow Up Items", 35),
             "touched_files": ("Relevant Files", 25),
+            "related_files": ("Additional Files", 26),
         }
 
         sections: list[dict[str, Any]] = []
+        consumed: set[str] = set()
         for key, (title, priority) in list_fields.items():
             values = self._coerce_to_strings(request_data.get(key))
             if not values:
@@ -692,15 +943,18 @@ class ContextBuilder:
                     "allow_truncate": False,
                 }
             )
-        return sections
+            consumed.add(key)
+        return sections, consumed
 
-    def _render_text_sections(self, request_data: dict[str, Any]) -> list[dict[str, Any]]:
+    def _render_text_sections(self, request_data: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
         text_fields = {
             "context": ("Additional Context", 22, "text"),
+            "product_spec": ("Product Specification", 18, "text"),
             "logs": ("Logs", 65, "text"),
             "current_diff": ("Current Diff", 65, "diff"),
         }
         sections: list[dict[str, Any]] = []
+        consumed: set[str] = set()
         for key, (title, priority, kind) in text_fields.items():
             value = request_data.get(key)
             if not isinstance(value, str) or not value.strip():
@@ -716,7 +970,90 @@ class ContextBuilder:
                     "allow_truncate": False,
                 }
             )
-        return sections
+            consumed.add(key)
+        return sections, consumed
+
+    def _render_embedding_sections(
+        self,
+        phase: str,
+        request_data: dict[str, Any],
+        *,
+        embedding_matches: Sequence[Mapping[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not embedding_matches:
+            return []
+        phase_key = phase.lower()
+        if phase_key not in self._EMBEDDING_PHASES:
+            return []
+
+        entries: list[str] = []
+        for raw in embedding_matches[: self._MAX_EMBEDDING_MATCHES]:
+            if not isinstance(raw, Mapping):
+                continue
+            path = raw.get("path")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            score_value = raw.get("score")
+            score_text = None
+            if isinstance(score_value, (int, float)):
+                score_text = f"{score_value:.2f}"
+            module = raw.get("module")
+            module_text = module if isinstance(module, str) and module.strip() else ""
+            header_parts = [f"- {path}"]
+            if module_text:
+                header_parts.append(f"({module_text})")
+            if score_text:
+                header_parts.append(f"score={score_text}")
+            entry_lines = [" ".join(header_parts)]
+            imports = raw.get("imports")
+            if isinstance(imports, Mapping):
+                internal = imports.get("internal")
+                if isinstance(internal, Sequence):
+                    internal_display: list[str] = []
+                    for item in internal[: self._MAX_DEPENDENCY_PREVIEW]:
+                        if not isinstance(item, Mapping):
+                            continue
+                        module_name = item.get("module")
+                        module_path = item.get("path")
+                        if isinstance(module_name, str) and module_name.strip():
+                            if isinstance(module_path, str) and module_path.strip():
+                                internal_display.append(f"{module_name} [{module_path}]")
+                            else:
+                                internal_display.append(module_name)
+                    if internal_display:
+                        entry_lines.append(f"  - internal imports: {', '.join(internal_display)}")
+                external = imports.get("external")
+                if isinstance(external, Sequence):
+                    external_display = [
+                        item.strip()
+                        for item in external[: self._MAX_DEPENDENCY_PREVIEW]
+                        if isinstance(item, str) and item.strip()
+                    ]
+                    if external_display:
+                        entry_lines.append(f"  - external imports: {', '.join(external_display)}")
+                imported_by = imports.get("imported_by")
+                if isinstance(imported_by, Sequence):
+                    importer_display = [
+                        item.strip()
+                        for item in imported_by[: self._MAX_DEPENDENCY_PREVIEW]
+                        if isinstance(item, str) and item.strip()
+                    ]
+                    if importer_display:
+                        entry_lines.append(f"  - imported by: {', '.join(importer_display)}")
+            entries.append("\n".join(entry_lines))
+
+        if not entries:
+            return []
+
+        text = "## Repository Index Insights\n" + "\n".join(entries)
+        return [
+            {
+                "label": "embedding_matches",
+                "text": text,
+                "priority": 32,
+                "allow_truncate": False,
+            }
+        ]
 
     def _render_snippet_sections(self, snippets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         sections: list[dict[str, Any]] = []
@@ -737,7 +1074,8 @@ class ContextBuilder:
                 header_parts.append(f"(up to line {end_line})")
             header = " ".join(header_parts)
             snippet_body = content.rstrip()
-            block = f"{header}\n```python\n{snippet_body}\n```"
+            language = self._detect_snippet_language(path)
+            block = f"{header}\n```{language}\n{snippet_body}\n```"
             if isinstance(reason, str) and reason.strip():
                 block = f"{block}\n- Reason: {reason.strip()}"
             sections.append(
@@ -750,10 +1088,41 @@ class ContextBuilder:
             )
         return sections
 
-    def _render_repo_tree_section(self) -> str:
+    def _detect_snippet_language(self, path: str) -> str:
+        path_obj = Path(path)
+        suffixes = [suffix.lower() for suffix in path_obj.suffixes]
+        for suffix in reversed(suffixes):
+            language = self._SNIPPET_LANGUAGE_MAP.get(suffix)
+            if language:
+                return language
+        name_key = path_obj.name.lower()
+        language = self._SNIPPET_NAME_LANGUAGE_MAP.get(name_key)
+        if language:
+            return language
+        return "text"
+
+    def _render_repo_tree_section(
+        self,
+        *,
+        limit_to: set[str] | None = None,
+        use_cache: bool = False,
+    ) -> str:
+        if use_cache and limit_to is None and self._workspace_repo_tree_cache is not None:
+            return self._workspace_repo_tree_cache
+
         entries = self._repo_file_list()
         if not entries:
             return ""
+
+        if limit_to:
+            filtered_entries: list[tuple[str, bool]] = []
+            for path, is_dir in entries:
+                normalized = path.rstrip("/")
+                if self._path_matches_targets(normalized, limit_to):
+                    filtered_entries.append((path, is_dir))
+            entries = filtered_entries
+            if not entries:
+                return ""
 
         tree_root: dict[str, object] = {}
         for path, is_dir in entries:
@@ -809,11 +1178,26 @@ class ContextBuilder:
             visible = max(line_limit - 1, 0)
             header += f" (truncated to first {visible} entries)"
         tree_body = "\n".join(lines)
-        return f"{header}\n{tree_body}"
+        result = f"{header}\n{tree_body}"
+        if use_cache and limit_to is None:
+            self._workspace_repo_tree_cache = result
+        return result
 
-    def _render_workspace_python_outline_section(self) -> str:
+    def _render_workspace_python_outline_section(
+        self,
+        *,
+        limit_to: set[str] | None = None,
+        use_cache: bool = False,
+    ) -> str:
+        if use_cache and limit_to is None and self._workspace_outline_cache is not None:
+            return self._workspace_outline_cache
+
         entries = self._repo_file_list()
         python_files = [path for path, is_dir in entries if not is_dir and path.endswith(".py")]
+        if limit_to:
+            python_files = [
+                path for path in python_files if self._path_matches_targets(path, limit_to)
+            ]
         if not python_files:
             return ""
 
@@ -832,7 +1216,10 @@ class ContextBuilder:
         if not outlines:
             return ""
         body = "\n\n".join(outlines)
-        return f"## Workspace Python Outline\n{body}"
+        result = f"## Workspace Python Outline\n{body}"
+        if use_cache and limit_to is None:
+            self._workspace_outline_cache = result
+        return result
 
     def _fallback_python_outline(self, path_key: str) -> str:
         file_path = self._repo_root / path_key
@@ -896,7 +1283,10 @@ class ContextBuilder:
                 return ""
         return ""
 
-    def _render_requirements_section(self) -> str:
+    def _render_requirements_section(self, *, use_cache: bool = False) -> str:
+        if use_cache and self._workspace_requirements_cache is not None:
+            return self._workspace_requirements_cache
+
         requirement_paths = self._find_requirements_files()
         if not requirement_paths:
             return ""
@@ -914,7 +1304,10 @@ class ContextBuilder:
             sections.append(f"### {path_str}\n```text\n{text}\n```")
         if not sections:
             return ""
-        return "## Workspace Requirements\n" + "\n\n".join(sections)
+        result = "## Workspace Requirements\n" + "\n\n".join(sections)
+        if use_cache:
+            self._workspace_requirements_cache = result
+        return result
 
     def _find_requirements_files(self) -> list[str]:
         entries = self._repo_file_list()
@@ -994,7 +1387,7 @@ class ContextBuilder:
             "- Identify key repository components with `name`, `summary`, `primary_paths`, `key_symbols`, and `related_tests`.",
             "- Populate `deliverable_map` to link each deliverable to the components or files that address it.",
             "- List existing tests, scripts, or commands that can validate future work under `validation_assets`.",
-            "- Capture outstanding unknowns in `knowledge_gaps` and risks in `risks`.",
+            "- Highlight outstanding unknowns in `notes` alongside risks in `risks`.",
         ]
         if deliverables:
             joined = ", ".join(deliverables)
@@ -1030,6 +1423,7 @@ class ContextBuilder:
                 }
             ],
             "new_tasks": ["Update prompt builder to include explicit schema reminders."],
+            "drop_tasks": ["Retire outdated README polish task."],
             "risks": ["Potential increase in prompt length; monitor token usage."],
             "notes": ["Roll out alongside schema-tolerant parsers."],
         }
@@ -1039,8 +1433,10 @@ class ContextBuilder:
             "- Return a JSON object with the following keys:",
             "  - `adjustments`: array of objects describing proposed changes. Each object may include `action`, `summary`, `details`, `rationale`, `priority`, `id`, and `notes` (string or list).",
             "  - `new_tasks`: array of strings naming follow-up tasks to add to the plan.",
+            "  - `drop_tasks`: array of task identifiers or titles to remove if they are incomplete.",
             "  - `risks`: array of strings summarising any newly identified risks.",
             "  - `notes`: array of strings with any additional context.",
+            "- Do not propose adjustments or new tasks whose only purpose is running tests; execution phases already exercise validation commands during task work.",
             "- Omit fields only when they are not applicable; never return nulls.",
             "- Keep values concise and actionable.",
             "### Example Response",
@@ -1064,6 +1460,8 @@ class ContextBuilder:
             "- Return well-formed JSON matching the implement phase response schema.",
             "- Populate `files` with any complete file payloads that should exist after this change. Each entry must include `path` and `content`, plus optional `encoding` and `executable` flags.",
             "- Use `edits` for targeted updates. Each entry must provide `path`, an `action` of `replace`, `insert`, or `delete`, optional `start_line`/`end_line` bounds, and `content` for inserted or replacement text.",
+            "- To remove a file entirely, emit a `delete` action for that `path` and omit `start_line`/`end_line`; the orchestrator will delete it.",
+            "- Deleting directories is allowed by targeting the directory path with a `delete` action (no line bounds); all tracked contents will be removed.",
             "- Keep `summary` to a single concise sentence describing the applied change; omit extended rationale or command walkthroughs.",
         ]
         if file_hint_line:
@@ -1098,6 +1496,8 @@ class ContextBuilder:
             "- Return well-formed JSON matching the fix_violations phase response schema.",
             "- Use `files` to supply complete file payloads for any files that should be rewritten; include `path`, `content`, and optional `encoding` or `executable` flags.",
             "- Use `edits` for targeted updates with `path`, an `action` of `replace`, `insert`, or `delete`, optional `start_line`/`end_line`, and `content` for insert or replace operations.",
+            "- To remove a file, emit a `delete` action without line bounds; the orchestrator interprets it as a full-file deletion.",
+            "- Target a directory path with a `delete` action (no line bounds) to remove the folder and its tracked files when appropriate.",
             "- Prefer the structured fields and leave `patch` empty unless a fallback unified diff is absolutely necessary.",
             "- Only populate `no_op_reason` when you are intentionally reporting that no fixes are required; otherwise leave it blank and return the necessary structured updates.",
             "- Populate `touched_files` with the relative paths you changed, supply concise `rationale` entries, and list required next steps in `follow_up` (e.g. rerun static gates).",
@@ -1325,10 +1725,69 @@ class ContextBuilder:
         return qualified_name
 
     @staticmethod
-    def _render_payload(data: dict[str, Any]) -> str:
+    def _render_payload(data: dict[str, Any], *, omit_keys: set[str] | None = None) -> str:
         """Convert structured request data into a prompt-friendly string."""
-        serialized = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        filtered = ContextBuilder._prune_payload_data(
+            data,
+            omit_keys=omit_keys or set(),
+        )
+        if not ContextBuilder._is_meaningful_payload_value(filtered):
+            return ""
+        serialized = json.dumps(filtered, sort_keys=True, separators=(",", ":"))
         return f"## Request Payload\n{serialized}"
+
+    @staticmethod
+    def _prune_payload_data(
+        value: Any,
+        *,
+        omit_keys: set[str],
+        _depth: int = 0,
+    ) -> Any:
+        if isinstance(value, Mapping):
+            filtered: dict[str, Any] = {}
+            for key, sub_value in value.items():
+                if _depth == 0 and key in omit_keys:
+                    continue
+                pruned = ContextBuilder._prune_payload_data(
+                    sub_value,
+                    omit_keys=omit_keys,
+                    _depth=_depth + 1,
+                )
+                if ContextBuilder._is_meaningful_payload_value(pruned):
+                    filtered[key] = pruned
+            return filtered
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            items: list[Any] = []
+            for item in value:
+                pruned_item = ContextBuilder._prune_payload_data(
+                    item,
+                    omit_keys=omit_keys,
+                    _depth=_depth + 1,
+                )
+                if ContextBuilder._is_meaningful_payload_value(pruned_item):
+                    items.append(pruned_item)
+            return items
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @staticmethod
+    def _is_meaningful_payload_value(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return True
+        if isinstance(value, (int, float)):
+            return True
+        if isinstance(value, str):
+            return bool(value)
+        if isinstance(value, Mapping):
+            return any(
+                ContextBuilder._is_meaningful_payload_value(item) for item in value.values()
+            )
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return any(ContextBuilder._is_meaningful_payload_value(item) for item in value)
+        return True
 
     def _assemble_prompt(
         self,
@@ -1407,7 +1866,12 @@ class ContextBuilder:
                 hints.update(self._coerce_to_strings(value))
         return {hint for hint in hints if hint}
 
-    def _extract_file_hints(self, request_data: dict[str, Any]) -> set[str]:
+    def _extract_file_hints(
+        self,
+        request_data: dict[str, Any],
+        *,
+        embedding_matches: Sequence[Mapping[str, Any]] | None = None,
+    ) -> set[str]:
         hints: set[str] = set()
         for key, value in request_data.items():
             lower_key = key.lower()
@@ -1453,6 +1917,34 @@ class ContextBuilder:
                     normalized = self._normalize_repo_path(item)
                     if normalized:
                         hints.add(normalized)
+        if embedding_matches:
+            for entry in embedding_matches:
+                if not isinstance(entry, Mapping):
+                    continue
+                path_value = entry.get("path")
+                if isinstance(path_value, str):
+                    normalized = self._normalize_repo_path(path_value)
+                    if normalized:
+                        hints.add(normalized)
+                imports = entry.get("imports")
+                if isinstance(imports, Mapping):
+                    internal = imports.get("internal")
+                    if isinstance(internal, Sequence):
+                        for item in internal:
+                            if not isinstance(item, Mapping):
+                                continue
+                            import_path = item.get("path")
+                            if isinstance(import_path, str):
+                                normalized = self._normalize_repo_path(import_path)
+                                if normalized:
+                                    hints.add(normalized)
+                    imported_by = imports.get("imported_by")
+                    if isinstance(imported_by, Sequence):
+                        for item in imported_by:
+                            if isinstance(item, str):
+                                normalized = self._normalize_repo_path(item)
+                                if normalized:
+                                    hints.add(normalized)
         return hints
 
     def _coerce_to_strings(self, value: Any) -> list[str]:
@@ -1461,10 +1953,12 @@ class ContextBuilder:
             return [stripped] if stripped else []
         if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
             collected: list[str] = []
+            seen: set[str] = set()
             for item in value:
                 if isinstance(item, str):
                     stripped = item.strip()
-                    if stripped:
+                    if stripped and stripped not in seen:
+                        seen.add(stripped)
                         collected.append(stripped)
             return collected
         return []
@@ -1484,9 +1978,29 @@ class ContextBuilder:
             candidate_key = candidate.as_posix()
             if (self._repo_root / candidate).exists():
                 return candidate_key
-            if fallback is None:
+            if fallback is None and self._is_plausible_hint(candidate_key):
                 fallback = candidate_key
         return fallback
+
+    @staticmethod
+    def _is_plausible_hint(candidate: str) -> bool:
+        if not candidate:
+            return False
+        lowered = candidate.lower()
+        if lowered == "collecting":
+            return False
+        blocked_prefixes = (
+            "site-packages/",
+            "dist-packages/",
+            "usr/",
+            "lib/python",
+            "__pycache__/",
+        )
+        if lowered.startswith(blocked_prefixes):
+            return False
+        if "/" not in candidate and "." not in candidate:
+            return False
+        return True
 
     @staticmethod
     def _candidate_repo_paths(path_str: str) -> list[str]:
@@ -1549,12 +2063,254 @@ class ContextBuilder:
                 paths.append(candidate)
         return paths
 
+    def _prepare_embedding_matches(
+        self,
+        phase: str,
+        request_data: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        matches = self._embedding_matches_for_request(phase, request_data)
+        if not matches:
+            return []
+        self._augment_matches_with_graph(matches)
+        return matches
+
+    def _embedding_matches_for_request(self, phase: str, request_data: dict[str, Any]) -> list[dict[str, Any]]:
+        phase_key = phase.lower()
+        if phase_key not in self._EMBEDDING_PHASES:
+            return []
+
+        index = self._load_embedding_index()
+        if index is None or index.is_empty:
+            return []
+
+        query_parts: list[str] = []
+        for key in ("goal", "diff_goal", "reason"):
+            value = request_data.get(key)
+            if isinstance(value, str):
+                trimmed = value.strip()
+                if trimmed:
+                    query_parts.append(trimmed)
+
+        sequence_keys = {
+            "deliverables",
+            "constraints",
+            "notes",
+            "suggested_changes",
+            "blockers",
+        }
+        for key in sequence_keys:
+            values = self._coerce_to_strings(request_data.get(key))
+            if not values:
+                continue
+            label = key.replace("_", " ").title()
+            preview = "; ".join(values[:5])
+            if preview:
+                query_parts.append(f"{label}: {preview}")
+
+        if not query_parts:
+            return []
+
+        query_text = "\n".join(query_parts)
+        try:
+            results = index.search(query_text, limit=self._MAX_EMBEDDING_MATCHES * 2)
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Embedding search failed for phase %s", phase_key, exc_info=True)
+            return []
+
+        matches: list[dict[str, Any]] = []
+        for path_value, score in results:
+            normalized = self._normalize_repo_path(path_value) or path_value
+            if not normalized or not normalized.endswith(".py"):
+                continue
+            matches.append({"path": normalized, "score": float(score)})
+            if len(matches) >= self._MAX_EMBEDDING_MATCHES:
+                break
+        return matches
+
+    def _augment_matches_with_graph(self, matches: list[dict[str, Any]]) -> None:
+        if not matches:
+            return
+
+        index = self._load_graph_index()
+        if index is None:
+            for entry in matches:
+                entry.setdefault("imports", {"internal": [], "external": [], "imported_by": []})
+            return
+
+        try:
+            module_records = index.modules()
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Graph index load failed", exc_info=True)
+            for entry in matches:
+                entry.setdefault("imports", {"internal": [], "external": [], "imported_by": []})
+            return
+
+        module_by_name = {
+            record.module: record
+            for record in module_records.values()
+            if record.module
+        }
+
+        importers: dict[str, list[str]] = {}
+        for record in module_records.values():
+            for dependency in record.imports:
+                importers.setdefault(dependency, []).append(record.path)
+
+        for entry in matches:
+            path = entry.get("path")
+            if not isinstance(path, str):
+                continue
+            record = module_records.get(path)
+            module_name = record.module if record else None
+            if module_name:
+                entry["module"] = module_name
+
+            internal: list[dict[str, str]] = []
+            external: list[str] = []
+            if record:
+                seen_internal: set[str] = set()
+                seen_external: set[str] = set()
+                for dependency in record.imports:
+                    target = module_by_name.get(dependency)
+                    if target is not None:
+                        if target.path in seen_internal:
+                            continue
+                        seen_internal.add(target.path)
+                        payload = {"module": target.module}
+                        if target.path:
+                            payload["path"] = target.path
+                        internal.append(payload)
+                    else:
+                        if dependency in seen_external:
+                            continue
+                        seen_external.add(dependency)
+                        external.append(dependency)
+
+            imported_by = []
+            if module_name:
+                imported_by = importers.get(module_name, [])
+
+            entry["imports"] = {
+                "internal": internal[: self._MAX_DEPENDENCY_PREVIEW],
+                "external": external[: self._MAX_DEPENDENCY_PREVIEW],
+                "imported_by": imported_by[: self._MAX_DEPENDENCY_PREVIEW],
+            }
+
+    def _serialize_embedding_matches(
+        self,
+        matches: Sequence[Mapping[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        if not matches:
+            return []
+        serialized: list[dict[str, Any]] = []
+        for entry in matches[: self._MAX_EMBEDDING_MATCHES]:
+            if not isinstance(entry, Mapping):
+                continue
+            path = entry.get("path")
+            if not isinstance(path, str):
+                continue
+            payload: dict[str, Any] = {"path": path}
+            score_value = entry.get("score")
+            if isinstance(score_value, (int, float)):
+                payload["score"] = round(float(score_value), 4)
+            module_value = entry.get("module")
+            if isinstance(module_value, str) and module_value.strip():
+                payload["module"] = module_value
+            imports = entry.get("imports")
+            if isinstance(imports, Mapping):
+                imports_payload: dict[str, Any] = {}
+                internal = imports.get("internal")
+                if isinstance(internal, Sequence):
+                    internal_entries: list[dict[str, str]] = []
+                    for item in internal[: self._MAX_DEPENDENCY_PREVIEW]:
+                        if not isinstance(item, Mapping):
+                            continue
+                        module_name = item.get("module")
+                        path_value = item.get("path")
+                        if isinstance(module_name, str) and module_name.strip():
+                            entry_payload: dict[str, str] = {"module": module_name}
+                            if isinstance(path_value, str) and path_value.strip():
+                                entry_payload["path"] = path_value
+                            internal_entries.append(entry_payload)
+                    if internal_entries:
+                        imports_payload["internal"] = internal_entries
+                external = imports.get("external")
+                if isinstance(external, Sequence):
+                    external_entries = [
+                        value.strip()
+                        for value in external[: self._MAX_DEPENDENCY_PREVIEW]
+                        if isinstance(value, str) and value.strip()
+                    ]
+                    if external_entries:
+                        imports_payload["external"] = external_entries
+                imported_by = imports.get("imported_by")
+                if isinstance(imported_by, Sequence):
+                    importer_entries = [
+                        value.strip()
+                        for value in imported_by[: self._MAX_DEPENDENCY_PREVIEW]
+                        if isinstance(value, str) and value.strip()
+                    ]
+                    if importer_entries:
+                        imports_payload["imported_by"] = importer_entries
+                if imports_payload:
+                    payload["imports"] = imports_payload
+            serialized.append(payload)
+        return serialized
+
+    def index_insights_for_plan(
+        self,
+        *,
+        goal: str | None,
+        constraints: Sequence[str] | None = None,
+        deliverables: Sequence[str] | None = None,
+        notes: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        goal_value = goal if isinstance(goal, str) else (str(goal) if goal is not None else "")
+        request_payload: dict[str, Any] = {
+            "goal": goal_value,
+            "constraints": list(constraints or []),
+            "deliverables": list(deliverables or []),
+            "notes": list(notes or []),
+        }
+        matches = self._prepare_embedding_matches("plan", request_payload)
+        if not matches:
+            return {}
+        return {"embedding_matches": self._serialize_embedding_matches(matches)}
+
+    def _load_embedding_index(self) -> EmbeddingsIndex | None:
+        if self._embedding_index_loaded:
+            return self._embedding_index
+        if self._embedding_index_path.exists():
+            try:
+                self._embedding_index = EmbeddingsIndex(self._embedding_index_path)
+            except Exception:  # pragma: no cover - defensive guard
+                LOGGER.debug("Failed to initialise embedding index", exc_info=True)
+                self._embedding_index = None
+        self._embedding_index_loaded = True
+        return self._embedding_index
+
+    def _load_graph_index(self) -> GraphIndex | None:
+        if self._graph_index_loaded:
+            return self._graph_index
+        if self._graph_index_path.exists():
+            try:
+                self._graph_index = GraphIndex(self._graph_index_path)
+            except Exception:  # pragma: no cover - defensive guard
+                LOGGER.debug("Failed to initialise graph index", exc_info=True)
+                self._graph_index = None
+        self._graph_index_loaded = True
+        return self._graph_index
+
     def invalidate_repository_cache(self) -> None:
         """Clear cached repository metadata so future prompts reflect current state."""
 
         self._repo_file_cache = None
         self._symbol_index = None
         self._symbol_index_loaded = False
+        self._embedding_index = None
+        self._embedding_index_loaded = False
+        self._graph_index = None
+        self._graph_index_loaded = False
 
     def _extract_path_from_test_id(self, identifier: str) -> str | None:
         if not isinstance(identifier, str):

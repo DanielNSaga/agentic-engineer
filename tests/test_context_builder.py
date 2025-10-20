@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ae.context_builder import ContextBuilder
 from ae.memory.code_index.symbol_index import SymbolIndex
+from ae.prompts import JSON_RESPONSE_INSTRUCTION
 
 
 def _bootstrap_index(repo_root: Path) -> None:
@@ -125,6 +126,150 @@ def test_context_builder_includes_snippets(tmp_path: Path) -> None:
         }
     ]
 
+
+def test_context_builder_snippet_language_detection(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    data_root = repo_root / "data"
+    data_root.mkdir()
+
+    builder = ContextBuilder(
+        repo_root=repo_root,
+        data_root=data_root,
+    )
+
+    snippet_text = '{\n  "key": "value"\n}'
+    request = {
+        "task_id": "task-json",
+        "snippets": [
+            {
+                "path": "config/settings.json",
+                "content": snippet_text,
+            }
+        ],
+    }
+
+    package = builder.build("implement", request)
+    assert "```json" in package.user_prompt
+    assert "```python" not in package.user_prompt
+
+
+def test_context_builder_preserves_logged_snippet_over_code_request(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    data_root = repo_root / "data"
+    data_root.mkdir()
+
+    source_path = repo_root / "src/example.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text(
+        "def value() -> str:\n    return 'new'\n",
+        encoding="utf-8",
+    )
+
+    builder = ContextBuilder(
+        repo_root=repo_root,
+        data_root=data_root,
+    )
+
+    recorded_snippet = "def value() -> str:\n    return 'old'\n"
+    request = {
+        "task_id": "diagnose-1",
+        "snippets": [
+            {
+                "path": "src/example.py",
+                "start_line": 1,
+                "end_line": 2,
+                "content": recorded_snippet,
+            }
+        ],
+        "code_requests": [
+            {
+                "path": "src/example.py",
+                "start_line": 1,
+                "end_line": 2,
+                "surround": 0,
+            }
+        ],
+    }
+
+    package = builder.build("diagnose", request)
+
+    assert recorded_snippet in package.user_prompt
+    assert "return 'new'" not in package.user_prompt
+
+
+def test_diagnose_prompt_includes_workspace_snapshot(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    data_root = repo_root / "data"
+    data_root.mkdir()
+
+    package_dir = repo_root / "src" / "package"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    init_path = package_dir / "__init__.py"
+    init_path.write_text("# package init\n", encoding="utf-8")
+
+    builder = ContextBuilder(
+        repo_root=repo_root,
+        data_root=data_root,
+    )
+
+    logs = "\n".join(
+        [
+            "collecting ...",
+            f"ImportError: cannot import name 'solution_to_ascii' from 'package' ({init_path})",
+        ]
+    )
+    request = {
+        "task_id": "diagnose-tree",
+        "failing_tests": ["tests/test_ascii.py::test_solution"],
+        "logs": logs,
+    }
+
+    package = builder.build("diagnose", request)
+
+    assert "## Repository Tree" in package.user_prompt
+    assert "src/package" in package.user_prompt
+
+    sections = {entry["label"]: entry for entry in package.metadata["sections"]}
+    assert sections["repo_tree"]["included"] is True
+    assert "collecting" not in (package.metadata.get("file_hints") or [])
+
+
+def test_context_builder_stashes_workspace_state_in_metadata(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    data_root = repo_root / "data"
+    data_root.mkdir()
+
+    builder = ContextBuilder(
+        repo_root=repo_root,
+        data_root=data_root,
+    )
+
+    request = {
+        "task_id": "diagnose-2",
+        "workspace_state": {
+            "head": "abc123",
+            "diff": "--- a\n+++ b\n",
+        },
+        "snippets": [
+            {
+                "path": "src/a.py",
+                "content": "print('hello')\n",
+            }
+        ],
+    }
+
+    package = builder.build("diagnose", request)
+
+    assert "workspace_state" not in package.user_prompt
+    metadata_state = package.metadata.get("workspace_state")
+    assert isinstance(metadata_state, dict)
+    assert metadata_state["head"] == "abc123"
+    assert package.metadata["request"]["task_id"] == "diagnose-2"
+
 def test_context_builder_surfaces_static_finding_snippets(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -201,7 +346,13 @@ def test_context_builder_exposes_workspace_metadata(tmp_path: Path) -> None:
         data_root=data_root,
     )
 
-    package = builder.build("implement", {"task_id": "workspace-check"})
+    package = builder.build(
+        "implement",
+        {
+            "task_id": "workspace-check",
+            "touched_files": ["src/app/main.py"],
+        },
+    )
 
     assert "## Workspace Python Outline" in package.user_prompt
     assert "### src/app/main.py :: symbol outline" in package.user_prompt
@@ -255,6 +406,8 @@ def test_context_builder_respects_token_budget(tmp_path: Path) -> None:
     package = builder.build("implement", request)
     metadata = package.metadata
 
+    assert JSON_RESPONSE_INSTRUCTION in package.system_prompt
+    assert JSON_RESPONSE_INSTRUCTION not in package.user_prompt
     assert metadata["token_estimate"] <= metadata["token_budget"]
     assert any(
         entry["label"] == "instructions" and entry["included"] for entry in metadata["sections"]
@@ -264,7 +417,7 @@ def test_context_builder_respects_token_budget(tmp_path: Path) -> None:
     )
 
 
-def test_context_builder_emits_repo_tree_for_all_phases(tmp_path: Path) -> None:
+def test_context_builder_scopes_repo_tree(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / "README.md").write_text("# Demo\n", encoding="utf-8")
@@ -281,16 +434,30 @@ def test_context_builder_emits_repo_tree_for_all_phases(tmp_path: Path) -> None:
         data_root=data_root,
     )
 
-    phases = ["plan", "analyze", "design", "implement", "plan_adjust", "fix_violations"]
-    for phase in phases:
-        package = builder.build(phase, {"goal": "demo"})
-        assert "## Repository Tree" in package.user_prompt
-        assert "src/" in package.user_prompt
-        assert "README.md" in package.user_prompt
-        assert "tests/" in package.user_prompt
-        assert any(
-            entry["label"] == "repo_tree" and entry["included"] for entry in package.metadata["sections"]
-        )
+    plan_package = builder.build("plan", {"goal": "demo"})
+    assert "## Repository Tree" in plan_package.user_prompt
+    assert "src/" in plan_package.user_prompt
+    assert "README.md" in plan_package.user_prompt
+    assert "tests/" in plan_package.user_prompt
+    plan_section = next(entry for entry in plan_package.metadata["sections"] if entry["label"] == "repo_tree")
+    assert plan_section["included"]
+
+    implement_package = builder.build("implement", {"goal": "demo"})
+    assert "## Repository Tree" not in implement_package.user_prompt
+    implement_sections = [entry for entry in implement_package.metadata["sections"] if entry["label"] == "repo_tree"]
+    assert not implement_sections or not implement_sections[0]["included"]
+
+    focused_package = builder.build(
+        "implement",
+        {"goal": "demo", "touched_files": ["src/greetings.py"]},
+    )
+    assert "## Repository Tree" in focused_package.user_prompt
+    assert "src/" in focused_package.user_prompt
+    assert "greetings.py" in focused_package.user_prompt
+    assert "tests/" not in focused_package.user_prompt
+    assert "README.md" not in focused_package.user_prompt
+    focused_section = next(entry for entry in focused_package.metadata["sections"] if entry["label"] == "repo_tree")
+    assert focused_section["included"]
 
 
 def test_context_builder_includes_plan_adjust_contract(tmp_path: Path) -> None:
@@ -315,6 +482,7 @@ def test_context_builder_includes_plan_adjust_contract(tmp_path: Path) -> None:
 
     assert "## Plan Adjust Response Contract" in package.user_prompt
     assert "\"adjustments\"" in package.user_prompt
+    assert "Do not propose adjustments or new tasks whose only purpose is running tests" in package.user_prompt
     contract_entries = [
         entry for entry in package.metadata["sections"] if entry["label"] == "plan_adjust_response_contract"
     ]

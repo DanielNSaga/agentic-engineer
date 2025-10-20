@@ -37,6 +37,8 @@ def test_init_plan_bootstraps_iteration_zero(tmp_path) -> None:
               config: "{config_path.as_posix()}"
               data: "{data_dir.as_posix()}"
               db_path: "{db_path.as_posix()}"
+            models:
+              default: gpt-5-offline
             """
         ).strip()
         + "\n",

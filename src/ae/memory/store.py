@@ -21,6 +21,7 @@ from .schema import (
     Incident,
     IncidentSeverity,
     Plan,
+    PlanStatus,
     Task,
     TaskStatus,
     TestRun,
@@ -405,12 +406,47 @@ class MemoryStore:
         return rows[0] if rows else None
 
     def update_task_status(self, task_id: str, status: TaskStatus) -> None:
-        timestamp = _as_iso(utc_now())
+        task_timestamp = _as_iso(utc_now())
         with self._transaction():
+            cursor = self._conn.execute("SELECT plan_id FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            if not row:
+                return
+            plan_id = row["plan_id"]
             self._conn.execute(
                 "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                (status.value, timestamp, task_id),
+                (status.value, task_timestamp, task_id),
             )
+
+            if status == TaskStatus.DONE:
+                remaining = self._conn.execute(
+                    "SELECT 1 FROM tasks WHERE plan_id = ? AND status != ? LIMIT 1",
+                    (plan_id, TaskStatus.DONE.value),
+                ).fetchone()
+                if remaining is None:
+                    plan_timestamp = _as_iso(utc_now())
+                    self._conn.execute(
+                        "UPDATE plans SET status = ?, updated_at = ? WHERE id = ?",
+                        (PlanStatus.COMPLETED.value, plan_timestamp, plan_id),
+                    )
+            else:
+                plan_timestamp = _as_iso(utc_now())
+                self._conn.execute(
+                    """
+                    UPDATE plans
+                    SET status = ?, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (PlanStatus.ACTIVE.value, plan_timestamp, plan_id, PlanStatus.COMPLETED.value),
+                )
+
+    def delete_tasks(self, task_ids: Sequence[str]) -> None:
+        cleaned = [task_id for task_id in task_ids if isinstance(task_id, str) and task_id]
+        if not cleaned:
+            return
+        placeholders = ",".join("?" for _ in cleaned)
+        with self._transaction():
+            self._conn.execute(f"DELETE FROM tasks WHERE id IN ({placeholders})", cleaned)
 
     # Decision operations --------------------------------------------------------------
     def record_decision(self, decision: Decision) -> None:

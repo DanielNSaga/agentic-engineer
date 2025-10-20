@@ -15,6 +15,7 @@ from ..context_builder import ContextBuilder
 from ..memory.reflections import get_planner_preflight_seed
 from ..models.llm_client import LLMClient
 from ..planning.schemas import PlannerDecision, PlannerResponse, PlannerRisk, PlannerTask
+from ..tools.snippets import SnippetRequest
 
 if TYPE_CHECKING:
     from .analyze import AnalyzeRequest, AnalyzeResponse
@@ -34,6 +35,31 @@ __all__ = [
 _ASSERTION_RE = re.compile(r"AssertionError: assert (?P<actual>.+?) == (?P<expected>.+)$")
 _ASSERTION_IN_RE = re.compile(r"AssertionError: assert (?P<needle>.+?) in (?P<haystack>.+)$")
 _STATIC_LOCATION_RE = re.compile(r"(?P<path>[^:\s]+\.py):(?P<line>\d+)")
+_IMPORT_ERROR_RE = re.compile(
+    r"ImportError:\s+cannot import name ['\"]?(?P<symbol>[\w.]+)['\"]?\s+from\s+['\"]?(?P<module>[\w.]+)['\"]?(?:\s+\((?P<path>[^)]+)\))?",
+    re.IGNORECASE,
+)
+_ATTRIBUTE_ERROR_RE = re.compile(
+    r"AttributeError:\s+(?:module|type object)\s+['\"](?P<module>[\w.]+)['\"]\s+has no attribute\s+['\"](?P<symbol>[\w.]+)['\"]",
+    re.IGNORECASE,
+)
+_MODULE_NOT_FOUND_RE = re.compile(
+    r"ModuleNotFoundError:\s+No module named ['\"](?P<module>[\w.]+)['\"]",
+    re.IGNORECASE,
+)
+_NAME_ERROR_RE = re.compile(
+    r"NameError:\s+name ['\"](?P<symbol>[\w.]+)['\"] is not defined",
+    re.IGNORECASE,
+)
+
+
+@dataclass(slots=True)
+class MissingSymbolSignal:
+    kind: str
+    symbol: str
+    module: str | None = None
+    path_hint: str | None = None
+    message: str | None = None
 
 
 def supports_local_logic(client: LLMClient) -> bool:
@@ -62,12 +88,10 @@ class LocalPhaseLogic:
             plan_steps.append("Verify all stated constraints are respected before finalizing.")
         risks = [f"Constraint: {item}" for item in request.constraints]
         risks.append("Risk: implementation diverges from existing tests if expectations are overlooked.")
-        open_questions = list(request.questions)
         return AnalyzeResponse(
             summary=summary,
             plan_steps=plan_steps,
             risks=risks,
-            open_questions=open_questions,
         )
 
     def design(self, request: "DesignRequest") -> "DesignResponse":
@@ -84,8 +108,6 @@ class LocalPhaseLogic:
             "Confirm behaviour against existing tests or fixtures that describe expected outcomes.",
             "Run targeted tests or commands mentioned in the implementation plan.",
         ]
-        if request.open_questions:
-            validation_plan.append("Follow up on outstanding questions before merging.")
         return DesignResponse(
             design_summary=design_summary,
             interface_changes=interface_changes,
@@ -193,70 +215,270 @@ class LocalPhaseLogic:
         )
 
     def diagnose(self, request: "DiagnoseRequest") -> "DiagnoseResponse | None":
-        from ..structured import StructuredFileArtifact
         from .diagnose import DiagnoseResponse
 
-        actual_expected = self._extract_assertions(request.logs or "")
-        logs_text = ""
-        if isinstance(request.logs, str):
-            logs_text = request.logs
-        elif isinstance(request.logs, Sequence):
-            logs_text = "\n".join(item for item in request.logs if isinstance(item, str))
-        logs_text_lower = logs_text.lower()
-        heuristic_suspicions: list[str] = []
-        heuristic_recommendations: list[str] = []
+        logs_text = self._normalise_logs(request.logs)
+        failing_tests = list(request.failing_tests)
+        missing_signals = self._parse_missing_symbol_signals(logs_text)
+        assertion_pairs = self._parse_assertion_pairs(logs_text)
 
-        if "unrecognized arguments" in logs_text_lower and "--master" in logs_text_lower:
-            heuristic_suspicions.append(
-                "CLI parser rejected expected authentication flags (e.g., --master or --non-interactive)."
-            )
-            heuristic_recommendations.append(
-                "Update CLI argument definitions to accept the flags exercised by tests."
-            )
+        suspected: list[str] = []
+        recommendations: list[str] = []
+        lessons: list[str] = []
+        code_requests: list[SnippetRequest] = list(request.code_requests)
+        existing_paths = {req.path for req in code_requests if isinstance(req, SnippetRequest)}
 
-        if "dict_keys' object has no attribute 'encode'" in logs_text_lower:
-            heuristic_suspicions.append(
-                "Dynamic dispatch routed dict_keys into password handling, indicating overly broad command probing."
-            )
-            heuristic_recommendations.append(
-                "Limit command dispatch helpers to module-level functions or correctly instantiated objects."
-            )
+        for signal in missing_signals:
+            module_display = signal.module or "the imported module"
+            description = f"Import failure: `{signal.symbol}` is unavailable from `{module_display}`."
+            if signal.kind == "module_not_found":
+                description = f"Missing module: `{module_display}` was not found when resolving imports."
+            elif signal.kind == "name_error":
+                description = f"Name error: `{signal.symbol}` is referenced before it is defined."
+            if signal.message and signal.message not in description:
+                description = f"{description} ({signal.message})"
+            suspected.append(description)
 
-        repo_root = self.context_builder.repo_root
-        artifacts: list[StructuredFileArtifact] = []
-        recommended: list[str] = []
+            candidate_paths = self._candidate_paths_for_missing_symbol(signal, request)
+            path_hint = candidate_paths[0] if candidate_paths else None
 
-        for actual, expected in actual_expected:
-            for relative in request.recent_changes:
-                path = (repo_root / relative).resolve()
-                if not path.exists() or path.suffix != ".py":
-                    continue
-                update = self._adjust_return_string(path, actual, expected)
-                if update:
-                    relative_path, updated_content = update
-                    artifacts.append(StructuredFileArtifact(path=relative_path, content=updated_content))
-                    recommended.append(f"Update return value in {relative} to match expected output.")
-                    break
+            if signal.kind == "module_not_found":
+                if path_hint:
+                    recommendations.append(
+                        f"Create the module at `{path_hint}` or adjust the import to target an existing module."
+                    )
+                else:
+                    recommendations.append(
+                        f"Create a package/module for `{module_display}` or update the import to use the correct entry point."
+                    )
+                lessons.append(f"Module `{module_display}` is unresolved; ensure the package structure exports it.")
+            elif signal.kind == "name_error":
+                location_hint = path_hint or "the failing module"
+                recommendations.append(
+                    f"Define `{signal.symbol}` in `{location_hint}` before it is referenced, or update the code to use an existing symbol."
+                )
+                lessons.append(f"Ensure `{signal.symbol}` is declared where tests expect to use it.")
+            else:
+                export_location = path_hint or module_display.replace(".", "/") + ".py"
+                recommendations.append(
+                    f"Implement and export `{signal.symbol}` from `{export_location}` (update `__all__` or re-export it)."
+                )
+                lessons.append(f"Expose `{signal.symbol}` from `{module_display}` to satisfy import statements.")
 
-        additional_tests = list(request.failing_tests)
+            for path in candidate_paths:
+                if path not in existing_paths:
+                    code_requests.append(
+                        SnippetRequest(
+                            path=path,
+                            surround=80,
+                            reason=f"Inspect where `{signal.symbol}` should be defined or exported.",
+                        )
+                    )
+                    existing_paths.add(path)
 
-        suspected = [f"Mismatch between actual '{a}' and expected '{b}'." for a, b in actual_expected]
-        if heuristic_suspicions:
-            suspected = [*heuristic_suspicions, *suspected]
+        if assertion_pairs:
+            for actual, expected in assertion_pairs:
+                suspected.append(f"Assertion mismatch: expected `{expected}` but received `{actual}`.")
+            if not any("Align" in item for item in recommendations):
+                recommendations.append("Align the implementation output with the values asserted by the failing tests.")
+            lessons.append("Tests are asserting different values than the implementation currently returns.")
+
         if not suspected:
-            suspected = ["Review failing tests and recent code changes."]
+            suspected.append("Unable to extract a specific failure signal; inspect failing tests and recent changes.")
+        if not recommendations:
+            recommendations.append("Review failing tests and logs to translate failures into concrete code changes.")
 
-        recommended_fixes = recommended or ["Inspect recent changes and align return values with expectations."]
-        if heuristic_recommendations:
-            recommended_fixes = [*heuristic_recommendations, *recommended_fixes]
+        suspected = list(dict.fromkeys(suspected))
+        recommendations = list(dict.fromkeys(recommendations))
+        lessons = list(dict.fromkeys(lessons))
+
+        confidence = 0.4
+        if missing_signals:
+            confidence = 0.78
+        elif assertion_pairs:
+            confidence = 0.6
 
         return DiagnoseResponse(
             suspected_causes=suspected,
-            recommended_fixes=recommended_fixes,
-            additional_tests=additional_tests,
-            confidence=0.7 if artifacts else 0.5,
-            files=artifacts,
+            recommended_fixes=recommendations,
+            additional_tests=failing_tests,
+            code_requests=code_requests,
+            iteration_lessons=lessons,
+            confidence=confidence,
         )
+
+    def _normalise_logs(self, logs: Any) -> str:
+        if isinstance(logs, str):
+            return logs
+        if isinstance(logs, Sequence) and not isinstance(logs, (bytes, bytearray)):
+            return "\n".join(item for item in logs if isinstance(item, str))
+        return ""
+
+    def _parse_missing_symbol_signals(self, logs_text: str) -> list[MissingSymbolSignal]:
+        signals: list[MissingSymbolSignal] = []
+        if not logs_text:
+            return signals
+
+        seen: set[tuple[str, str, str, str]] = set()
+
+        def _add(signal: MissingSymbolSignal) -> None:
+            key = (
+                signal.kind,
+                signal.symbol.lower(),
+                (signal.module or "").lower(),
+                (signal.path_hint or "").lower(),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            signals.append(signal)
+
+        for match in _IMPORT_ERROR_RE.finditer(logs_text):
+            symbol = (match.group("symbol") or "").strip()
+            module = (match.group("module") or "").strip()
+            path_hint = (match.group("path") or "").strip() or None
+            if not symbol:
+                continue
+            _add(
+                MissingSymbolSignal(
+                    kind="import_error",
+                    symbol=symbol,
+                    module=module or None,
+                    path_hint=path_hint,
+                    message=match.group(0).strip(),
+                )
+            )
+
+        for match in _ATTRIBUTE_ERROR_RE.finditer(logs_text):
+            symbol = (match.group("symbol") or "").strip()
+            module = (match.group("module") or "").strip()
+            if not symbol:
+                continue
+            _add(
+                MissingSymbolSignal(
+                    kind="attribute_error",
+                    symbol=symbol,
+                    module=module or None,
+                    message=match.group(0).strip(),
+                )
+            )
+
+        for match in _MODULE_NOT_FOUND_RE.finditer(logs_text):
+            module = (match.group("module") or "").strip()
+            if not module:
+                continue
+            _add(
+                MissingSymbolSignal(
+                    kind="module_not_found",
+                    symbol=module,
+                    module=module,
+                    message=match.group(0).strip(),
+                )
+            )
+
+        for match in _NAME_ERROR_RE.finditer(logs_text):
+            symbol = (match.group("symbol") or "").strip()
+            if not symbol:
+                continue
+            _add(
+                MissingSymbolSignal(
+                    kind="name_error",
+                    symbol=symbol,
+                    message=match.group(0).strip(),
+                )
+            )
+
+        return signals
+
+    def _parse_assertion_pairs(self, logs_text: str) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        if not logs_text:
+            return pairs
+        for line in logs_text.splitlines():
+            stripped = line.strip()
+            match_eq = _ASSERTION_RE.search(stripped)
+            if match_eq:
+                actual = self._strip_quotes(match_eq.group("actual").strip())
+                expected = self._strip_quotes(match_eq.group("expected").strip())
+                pairs.append((actual, expected))
+                continue
+            match_in = _ASSERTION_IN_RE.search(stripped)
+            if match_in:
+                haystack = self._strip_quotes(match_in.group("haystack").strip())
+                needle = self._strip_quotes(match_in.group("needle").strip())
+                pairs.append((haystack, needle))
+        return pairs
+
+    def _candidate_paths_for_missing_symbol(
+        self,
+        signal: MissingSymbolSignal,
+        request: "DiagnoseRequest",
+    ) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path: str | None) -> None:
+            if not path or path in seen:
+                return
+            seen.add(path)
+            candidates.append(path)
+
+        if signal.path_hint:
+            hint_path = self._repo_relative_path(signal.path_hint)
+            if hint_path:
+                _add(hint_path)
+
+        module = signal.module or ""
+        if module:
+            module_key = module.replace(".", "/")
+            file_candidate = self._repo_relative_path(f"{module_key}.py")
+            package_candidate = self._repo_relative_path(f"{module_key}/__init__.py")
+            _add(file_candidate)
+            _add(package_candidate)
+
+        lowered_symbol = signal.symbol.lower()
+
+        for relative in request.recent_changes:
+            if not isinstance(relative, str):
+                continue
+            candidate = relative.strip()
+            if not candidate or lowered_symbol not in Path(candidate).stem.lower():
+                continue
+            resolved = self._repo_relative_path(candidate)
+            if resolved:
+                _add(resolved)
+
+        for snippet in request.snippets:
+            path = getattr(snippet, "path", None)
+            if not isinstance(path, str):
+                continue
+            candidate = self._repo_relative_path(path)
+            if not candidate:
+                continue
+            if lowered_symbol in Path(path).stem.lower():
+                _add(candidate)
+
+        return candidates
+
+    def _repo_relative_path(self, path: str | Path | None, *, must_exist: bool = True) -> str | None:
+        if not path:
+            return None
+        repo_root = self.context_builder.repo_root
+        path_text = str(path).strip().strip("'\"")
+        if path_text.endswith(")"):
+            path_text = path_text.rstrip(")")
+        candidate = Path(path_text)
+        try:
+            if candidate.is_absolute():
+                resolved = candidate.resolve()
+            else:
+                resolved = (repo_root / candidate).resolve()
+            relative = resolved.relative_to(repo_root)
+        except (OSError, ValueError):
+            return None
+        if must_exist and not resolved.exists():
+            return None
+        return relative.as_posix()
 
     def plan(self, request: "PlanRequest") -> "PlanResponse":
         goal = request.goal.strip()
@@ -357,6 +579,7 @@ class LocalPhaseLogic:
         return PlanAdjustResponse(
             adjustments=adjustments,
             new_tasks=new_tasks,
+            drop_tasks=[],
             risks=risks,
             notes=notes,
         )
@@ -616,24 +839,6 @@ class LocalPhaseLogic:
         return "\n".join([header, *diff_lines]) + "\n"
 
     @staticmethod
-    def _extract_assertions(logs: str) -> list[tuple[str, str]]:
-        pairs: list[tuple[str, str]] = []
-        for line in logs.splitlines():
-            stripped = line.strip()
-            match_eq = _ASSERTION_RE.search(stripped)
-            if match_eq:
-                actual = LocalPhaseLogic._strip_quotes(match_eq.group("actual").strip())
-                expected = LocalPhaseLogic._strip_quotes(match_eq.group("expected").strip())
-                pairs.append((actual, expected))
-                continue
-            match_in = _ASSERTION_IN_RE.search(stripped)
-            if match_in:
-                haystack = LocalPhaseLogic._strip_quotes(match_in.group("haystack").strip())
-                needle = LocalPhaseLogic._strip_quotes(match_in.group("needle").strip())
-                pairs.append((haystack, needle))
-        return pairs
-
-    @staticmethod
     def _strip_quotes(value: str) -> str:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             return value[1:-1]
@@ -641,38 +846,3 @@ class LocalPhaseLogic:
             inner = value[5:-1]
             return LocalPhaseLogic._strip_quotes(inner)
         return value
-
-    def _adjust_return_string(self, path: Path, actual: str, expected: str) -> tuple[str, str] | None:
-        repo_root = self.context_builder.repo_root
-        original = path.read_text(encoding="utf-8")
-        lines = original.splitlines()
-        tree = ast.parse(original)
-        for node in tree.body:
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            if not node.args.args:
-                continue
-            return_stmt = self._find_constant_return(node)
-            if return_stmt is None:
-                continue
-            value = return_stmt.value
-            if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
-                continue
-            if value.value != actual:
-                continue
-            first_arg = node.args.args[0].arg
-            index = return_stmt.lineno - 1
-            indent = self._leading_whitespace(lines[index])
-            if expected.lower().startswith("hello "):
-                lines[index] = f'{indent}return f"hello {{{first_arg}}}"'
-            else:
-                lines[index] = f"{indent}return {json.dumps(expected)}"
-            updated = "\n".join(lines).rstrip() + "\n"
-            if updated == original:
-                continue
-            try:
-                relative = path.relative_to(repo_root).as_posix()
-            except ValueError:
-                relative = path.as_posix()
-            return relative, updated
-        return None

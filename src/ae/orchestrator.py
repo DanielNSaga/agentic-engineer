@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
 import os
 import re
@@ -13,7 +12,7 @@ import time
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
@@ -50,7 +49,9 @@ from .tools.snippets import (
     normalize_static_findings,
 )
 from .tools.static_output import resolve_static_parser
+from .tools.workspace_state import capture_workspace_state
 from .tools.vcs import GitCheckpoint, GitError, GitRepository
+from .utils import abbreviate_slug, slugify
 
 if TYPE_CHECKING:
     from .planning.executor import AutoAppliedAdjustment
@@ -217,7 +218,7 @@ class IterationSettings:
 class GitAutomationState:
     """Runtime git automation configuration and bookkeeping."""
 
-    auto_clean_enabled: bool = False
+    auto_clean_enabled: bool = True
     include_untracked: bool = True
     workspace_path: Path | None = None
     workspace_method: str | None = None
@@ -231,6 +232,8 @@ class GitAutomationState:
     push_branch: str | None = None
     push_force: bool = False
     push_set_upstream: bool = False
+    workspace_keep_last: int = 5
+    workspace_retention_hours: float | None = 24.0
 
 
 @dataclass(slots=True)
@@ -1996,6 +1999,17 @@ class Orchestrator:
             failing_tests = self._extract_failing_tests(tests_result)
             recent_changes = self._format_recent_changes(changed_paths, repo.root)
 
+            workspace_state_payload: dict[str, Any] | None = None
+            try:
+                snapshot = capture_workspace_state(
+                    repo,
+                    checkpoint_label=checkpoint.label if checkpoint is not None else None,
+                )
+            except Exception:
+                snapshot = None
+            if snapshot is not None:
+                workspace_state_payload = snapshot.to_dict()
+
             while True:
                 diagnose_snippets = self._refresh_snippet_cache(repo, diagnose_snippets)
                 diagnose_request = DiagnoseRequest(
@@ -2006,6 +2020,7 @@ class Orchestrator:
                     snippets=list(diagnose_snippets),
                     attempt_history=list(diagnose_history),
                     iteration_guidance=list(iteration_guidance),
+                    workspace_state=workspace_state_payload,
                 )
                 diagnose_response = self.run_phase(PhaseName.DIAGNOSE, diagnose_request)
                 result.diagnose = diagnose_response
@@ -2950,6 +2965,31 @@ class Orchestrator:
             include_bool = self._coerce_bool(include_value)
             if include_bool is not None:
                 state.include_untracked = include_bool
+            retention_candidate = None
+            for key in (
+                "retention_hours",
+                "workspace_retention_hours",
+                "prune_after_hours",
+            ):
+                if key in auto_clean_cfg:
+                    retention_candidate = auto_clean_cfg.get(key)
+                    break
+            retention_hours = self._coerce_non_negative_float(retention_candidate)
+            if retention_hours is not None:
+                state.workspace_retention_hours = None if retention_hours == 0 else retention_hours
+
+            keep_candidate = None
+            for key in (
+                "max_workspaces",
+                "retain_workspaces",
+                "keep_last",
+            ):
+                if key in auto_clean_cfg:
+                    keep_candidate = auto_clean_cfg.get(key)
+                    break
+            keep_last = self._coerce_non_negative_int(keep_candidate)
+            if keep_last is not None:
+                state.workspace_keep_last = keep_last
         elif auto_clean_cfg is not None:
             clean_bool = self._coerce_bool(auto_clean_cfg)
             if clean_bool is not None:
@@ -2990,9 +3030,6 @@ class Orchestrator:
             push_bool = self._coerce_bool(push_cfg)
             if push_bool is not None:
                 state.push_enabled = push_bool
-
-        state.auto_clean_enabled = True
-        state.include_untracked = True
 
         return state
 
@@ -3099,6 +3136,68 @@ class Orchestrator:
             message = process.stderr.strip() or process.stdout.strip() or "unknown git error"
             raise GitError(f"Failed to create isolated workspace: {message}")
         return GitRepository(workspace_root)
+
+    def _prune_workspace_clones(
+        self,
+        *,
+        keep_last: int | None,
+        retention_hours: float | None,
+        active_workspace: Path | None = None,
+    ) -> None:
+        data_root = self._context_builder.data_root
+        workspace_base = (data_root / "workspaces").resolve()
+        try:
+            workspace_base_exists = workspace_base.exists()
+        except OSError:
+            return
+        if not workspace_base_exists:
+            return
+        active_resolved: Path | None = None
+        if active_workspace is not None:
+            try:
+                active_resolved = Path(active_workspace).resolve()
+            except OSError:
+                active_resolved = None
+        try:
+            candidates: list[tuple[Path, float]] = []
+            for entry in workspace_base.iterdir():
+                if entry.name.startswith("."):
+                    continue
+                if not entry.is_dir():
+                    continue
+                if not entry.name.startswith("ae-workspace-"):
+                    continue
+                if active_resolved is not None:
+                    try:
+                        if entry.resolve() == active_resolved:
+                            continue
+                    except OSError:
+                        continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                candidates.append((entry, mtime))
+        except OSError:
+            return
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        preserve_count = keep_last if isinstance(keep_last, int) and keep_last > 0 else 0
+        cutoff_ts = None
+        if retention_hours is not None and retention_hours > 0:
+            cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=retention_hours)).timestamp()
+
+        for index, (path, mtime) in enumerate(candidates):
+            remove = False
+            if preserve_count and index >= preserve_count:
+                remove = True
+            if cutoff_ts is not None and mtime < cutoff_ts:
+                remove = True
+            if not remove:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
 
     def _configure_workspace_remotes(
         self,
@@ -3218,23 +3317,32 @@ class Orchestrator:
         """Tear down any isolated workspace created for automation."""
 
         workspace_root = git_state.workspace_path
-        original_root = git_state.original_repo_root
-        if original_root and workspace_root and workspace_root != original_root:
-            original_config = git_state.original_config_path
-            self._rebind_runtime_environment(
-                repo_root=original_root,
-                config_path=original_config,
-            )
+        prune_kwargs = {
+            "keep_last": git_state.workspace_keep_last,
+            "retention_hours": git_state.workspace_retention_hours,
+            "active_workspace": workspace_root,
+        }
 
-        if not git_state.auto_clean_enabled:
-            return
-        if not workspace_root or git_state.workspace_method != "clone":
-            return
+        try:
+            original_root = git_state.original_repo_root
+            if original_root and workspace_root and workspace_root != original_root:
+                original_config = git_state.original_config_path
+                self._rebind_runtime_environment(
+                    repo_root=original_root,
+                    config_path=original_config,
+                )
 
-        if not revert_on_exit:
-            self._mirror_workspace_to_primary(repo, git_state, result)
+            if not git_state.auto_clean_enabled:
+                return
+            if not workspace_root or git_state.workspace_method != "clone":
+                return
 
-        shutil.rmtree(workspace_root, ignore_errors=True)
+            if not revert_on_exit:
+                self._mirror_workspace_to_primary(repo, git_state, result)
+
+            shutil.rmtree(workspace_root, ignore_errors=True)
+        finally:
+            self._prune_workspace_clones(**prune_kwargs)
 
     def _resolve_db_path(self) -> Path:
         paths_section = self._config.get("paths")
@@ -3396,10 +3504,8 @@ class Orchestrator:
         return target
 
     @staticmethod
-    def _slugify(value: str) -> str:
-        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
-        slug = slug.strip("-")
-        return slug or "iteration"
+    def _slugify(value: str, *, fallback: str = "iteration", max_length: int = 80) -> str:
+        return slugify(value, fallback=fallback, max_length=max_length, lowercase=False)
 
     @staticmethod
     def _coerce_bool(value: Any) -> bool | None:
@@ -3415,6 +3521,51 @@ class Orchestrator:
             return bool(value)
         return None
 
+    @staticmethod
+    def _coerce_non_negative_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            if value >= 0:
+                return int(value)
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                return None
+            try:
+                parsed = int(trimmed)
+            except ValueError:
+                try:
+                    parsed_float = float(trimmed)
+                except ValueError:
+                    return None
+                else:
+                    return int(parsed_float) if parsed_float >= 0 else None
+            else:
+                return parsed if parsed >= 0 else None
+        return None
+
+    @staticmethod
+    def _coerce_non_negative_float(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return number if number >= 0 else None
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                return None
+            try:
+                number = float(trimmed)
+            except ValueError:
+                return None
+            return number if number >= 0 else None
+        return None
+
     def _render_git_template(self, template: str, plan_id: str | None, task_id: str) -> str:
         """Format git automation templates with standard placeholders."""
 
@@ -3422,8 +3573,8 @@ class Orchestrator:
         context = {
             "plan_id": plan_id or "",
             "task_id": task_id,
-            "plan_slug": self._slugify(plan_id) if plan_id else "",
-            "task_slug": self._slugify(task_id),
+            "plan_slug": self._slugify(plan_id, fallback="plan") if plan_id else "",
+            "task_slug": self._slugify(task_id, fallback="task"),
             "timestamp": timestamp,
         }
         try:
@@ -3433,17 +3584,7 @@ class Orchestrator:
 
     @staticmethod
     def _abbreviate_slug(segment: str, *, fallback: str = "task", max_length: int = 80) -> str:
-        slug = segment.strip("-")
-        if not slug:
-            return fallback
-        if len(slug) <= max_length:
-            return slug
-        digest = hashlib.sha256(slug.encode("utf-8")).hexdigest()[:8]
-        prefix_length = max(max_length - len(digest) - 1, 1)
-        prefix = slug[:prefix_length].rstrip("-")
-        if not prefix:
-            prefix = slug[:prefix_length]
-        return f"{prefix}-{digest}"
+        return abbreviate_slug(segment, fallback=fallback, max_length=max_length)
 
     def _write_iteration_artifact(
         self,
@@ -3456,7 +3597,9 @@ class Orchestrator:
     ) -> Path:
         artifact_root = self._resolve_artifact_root(revert_on_exit=revert_on_exit)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        filename = f"{self._slugify(plan_id)}__{self._slugify(task_id)}__{timestamp}.json"
+        plan_slug = self._slugify(plan_id, fallback="plan")
+        task_slug = self._slugify(task_id, fallback="task")
+        filename = f"{plan_slug}__{task_slug}__{timestamp}.json"
         artifact_path = artifact_root / filename
         payload = self._serialize_iteration_result(
             plan_id=plan_id,

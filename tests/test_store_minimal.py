@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from ae.memory.schema import Checkpoint, Plan, Reflection, Task, TaskStatus
+from ae.memory.schema import Checkpoint, Plan, PlanStatus, Reflection, Task, TaskStatus
 from ae.memory.store import MemoryStore
 
 
@@ -50,6 +50,38 @@ def test_plan_task_checkpoint_roundtrip(tmp_path) -> None:
         top_scope = store.reflections.get_top_reflections(reflection.scope, limit=1)
         assert top_scope
         assert top_scope[0].id == reflection.id
+
+
+def test_plan_status_auto_updates(tmp_path) -> None:
+    db_path = tmp_path / "ae.sqlite"
+    with MemoryStore(db_path) as store:
+        plan = Plan(
+            id="auto-plan",
+            name="Auto completion plan",
+            goal="Ensure plans transition automatically",
+            status=PlanStatus.ACTIVE,
+        )
+        store.create_plan(plan)
+
+        first = Task(id="task-a", plan_id=plan.id, title="First task")
+        second = Task(id="task-b", plan_id=plan.id, title="Second task")
+        store.save_task(first)
+        store.save_task(second)
+
+        store.update_task_status(first.id, TaskStatus.DONE)
+        after_first = store.get_plan(plan.id)
+        assert after_first is not None
+        assert after_first.status == PlanStatus.ACTIVE
+
+        store.update_task_status(second.id, TaskStatus.DONE)
+        after_second = store.get_plan(plan.id)
+        assert after_second is not None
+        assert after_second.status == PlanStatus.COMPLETED
+
+        store.update_task_status(second.id, TaskStatus.READY)
+        reopened = store.get_plan(plan.id)
+        assert reopened is not None
+        assert reopened.status == PlanStatus.ACTIVE
 
 
 def test_memory_store_falls_back_when_db_path_readonly(tmp_path) -> None:

@@ -19,8 +19,15 @@ class ImplementRequest:
     task_id: str
     diff_goal: str
     touched_files: list[str] = field(default_factory=list)
+    related_files: list[str] = field(default_factory=list)
     test_plan: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    acceptance_criteria: list[str] = field(default_factory=list)
+    deliverables: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    context: str = ""
+    product_spec: str = ""
     snippets: list[Snippet] = field(default_factory=list)
     code_requests: list[SnippetRequest] = field(default_factory=list)
     static_findings: list[StaticFinding] = field(default_factory=list)

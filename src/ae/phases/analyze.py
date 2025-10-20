@@ -18,7 +18,7 @@ class AnalyzeRequest:
     goal: str
     context: str = ""
     constraints: list[str] = field(default_factory=list)
-    questions: list[str] = field(default_factory=list)
+    product_spec: str = ""
 
 
 @dataclass(slots=True)
@@ -28,7 +28,6 @@ class AnalyzeResponse:
     summary: str
     plan_steps: list[str]
     risks: list[str] = field(default_factory=list)
-    open_questions: list[str] = field(default_factory=list)
 
 
 def run(request: AnalyzeRequest, *, client: LLMClient, context_builder: ContextBuilder) -> AnalyzeResponse:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..context_builder import ContextBuilder
 from ..models.llm_client import LLMClient, LLMClientError
@@ -24,6 +25,7 @@ class DiagnoseRequest:
     code_requests: list[SnippetRequest] = field(default_factory=list)
     attempt_history: list[str] = field(default_factory=list)
     iteration_guidance: list[str] = field(default_factory=list)
+    workspace_state: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
